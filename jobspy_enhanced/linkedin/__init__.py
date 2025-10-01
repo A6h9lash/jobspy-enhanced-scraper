@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 import time
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 from urllib.parse import urlparse, urlunparse, unquote
 
@@ -207,18 +207,49 @@ class LinkedIn(Scraper):
         metadata_card = job_card.find("div", class_="base-search-card__metadata")
         location = self._get_location(metadata_card)
 
-        datetime_tag = (
-            metadata_card.find("time", class_="job-search-card__listdate")
-            if metadata_card
-            else None
-        )
+        # Try multiple selectors for date posted information
         date_posted = None
-        if datetime_tag and "datetime" in datetime_tag.attrs:
-            datetime_str = datetime_tag["datetime"]
-            try:
-                date_posted = datetime.strptime(datetime_str, "%Y-%m-%d")
-            except:
-                date_posted = None
+        
+        if metadata_card:
+            # Try different possible selectors for date information
+            datetime_tag = None
+            
+            # First try: job-search-card__listdate class
+            datetime_tag = metadata_card.find("time", class_="job-search-card__listdate")
+            
+            # Second try: any time tag with datetime attribute
+            if not datetime_tag:
+                datetime_tag = metadata_card.find("time", attrs={"datetime": True})
+            
+            # Third try: look for relative time text and parse it
+            if not datetime_tag:
+                time_elements = metadata_card.find_all("time")
+                for time_elem in time_elements:
+                    if time_elem.get("datetime"):
+                        datetime_tag = time_elem
+                        break
+            
+            # Fourth try: look for any element with datetime attribute
+            if not datetime_tag:
+                datetime_tag = metadata_card.find(attrs={"datetime": True})
+            
+            # Parse the datetime if found
+            if datetime_tag and "datetime" in datetime_tag.attrs:
+                datetime_str = datetime_tag["datetime"]
+                try:
+                    # Try different datetime formats
+                    for fmt in ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%SZ"]:
+                        try:
+                            date_posted = datetime.strptime(datetime_str, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                except:
+                    date_posted = None
+            
+            # If still no date found, try to parse relative time text
+            if not date_posted:
+                date_posted = self._parse_relative_date(metadata_card)
         job_details = {}
         if full_descr:
             job_details = self._get_job_details(job_id)
@@ -342,3 +373,111 @@ class LinkedIn(Scraper):
                 job_url_direct = unquote(job_url_direct_match.group())
 
         return job_url_direct
+
+    def _parse_relative_date(self, metadata_card) -> Optional[date]:
+        """
+        Parse relative date strings like "2 days ago", "1 week ago", etc.
+        :param metadata_card: BeautifulSoup element containing metadata
+        :return: date object or None
+        """
+        if not metadata_card:
+            return None
+            
+        # Look for text that might contain relative dates
+        text_content = metadata_card.get_text().lower()
+        
+        # Common relative date patterns
+        import re
+        from datetime import timedelta
+        
+        today = datetime.now().date()
+        
+        # Pattern for "X days ago"
+        days_match = re.search(r'(\d+)\s+days?\s+ago', text_content)
+        if days_match:
+            days = int(days_match.group(1))
+            return today - timedelta(days=days)
+        
+        # Pattern for "X weeks ago"
+        weeks_match = re.search(r'(\d+)\s+weeks?\s+ago', text_content)
+        if weeks_match:
+            weeks = int(weeks_match.group(1))
+            return today - timedelta(weeks=weeks)
+        
+        # Pattern for "X months ago"
+        months_match = re.search(r'(\d+)\s+months?\s+ago', text_content)
+        if months_match:
+            months = int(months_match.group(1))
+            # Approximate months as 30 days
+            return today - timedelta(days=months * 30)
+        
+        # Pattern for "X years ago"
+        years_match = re.search(r'(\d+)\s+years?\s+ago', text_content)
+        if years_match:
+            years = int(years_match.group(1))
+            # Approximate years as 365 days
+            return today - timedelta(days=years * 365)
+        
+        # Pattern for "yesterday"
+        if 'yesterday' in text_content:
+            return today - timedelta(days=1)
+        
+        # Pattern for "today"
+        if 'today' in text_content:
+            return today
+        
+        # Look for any time element that might have relative text
+        time_elements = metadata_card.find_all("time")
+        for time_elem in time_elements:
+            time_text = time_elem.get_text().lower()
+            if any(keyword in time_text for keyword in ['ago', 'yesterday', 'today']):
+                # Try to parse this specific time element
+                return self._parse_relative_date_from_text(time_text)
+        
+        return None
+    
+    def _parse_relative_date_from_text(self, text: str) -> Optional[date]:
+        """
+        Parse relative date from a specific text string
+        :param text: text containing relative date
+        :return: date object or None
+        """
+        import re
+        from datetime import timedelta
+        
+        today = datetime.now().date()
+        text = text.lower().strip()
+        
+        # Pattern for "X days ago"
+        days_match = re.search(r'(\d+)\s+days?\s+ago', text)
+        if days_match:
+            days = int(days_match.group(1))
+            return today - timedelta(days=days)
+        
+        # Pattern for "X weeks ago"
+        weeks_match = re.search(r'(\d+)\s+weeks?\s+ago', text)
+        if weeks_match:
+            weeks = int(weeks_match.group(1))
+            return today - timedelta(weeks=weeks)
+        
+        # Pattern for "X months ago"
+        months_match = re.search(r'(\d+)\s+months?\s+ago', text)
+        if months_match:
+            months = int(months_match.group(1))
+            return today - timedelta(days=months * 30)
+        
+        # Pattern for "X years ago"
+        years_match = re.search(r'(\d+)\s+years?\s+ago', text)
+        if years_match:
+            years = int(years_match.group(1))
+            return today - timedelta(days=years * 365)
+        
+        # Pattern for "yesterday"
+        if 'yesterday' in text:
+            return today - timedelta(days=1)
+        
+        # Pattern for "today"
+        if 'today' in text:
+            return today
+        
+        return None
