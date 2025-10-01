@@ -1,8 +1,13 @@
+# Core metadata
 include README.md
 include LICENSE
 include pyproject.toml
 include setup.py
+include requirements.txt
+include MANIFEST.in
+
+# Source code
 recursive-include jobspy_enhanced *.py
-recursive-exclude jobspy_enhanced __pycache__
-recursive-exclude jobspy_enhanced *.pyc
-recursive-exclude jobspy_enhanced *.pyo
+
+# Exclude junk
+recursive-exclude jobspy_enhanced __pycache__ *.pyc *.pyo
