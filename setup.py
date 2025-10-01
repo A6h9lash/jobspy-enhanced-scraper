@@ -10,9 +10,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="jobspy-enhanced-scraper",
-    version="2.0.0",
-    author="Cullen Watson, Zachary Hampton, Enhanced by Community",
-    author_email="cullen@cullenwatson.com",
+    version="1.0.0",
     description="Enhanced job scraper for LinkedIn, Indeed, Glassdoor, ZipRecruiter with improved filtering capabilities",
     long_description=long_description,
     long_description_content_type="text/markdown",
