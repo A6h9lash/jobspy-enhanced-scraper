@@ -33,7 +33,7 @@ jobs:
         
     - name: Install build tools
       run: |
-        poetry add --group dev twine build
+        poetry run pip install twine build
         
     - name: Build package
       run: |
