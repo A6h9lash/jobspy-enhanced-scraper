@@ -1,0 +1,11 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include requirements.txt
+include pyproject.toml
+recursive-include linkedin_jobspy *.py
+global-exclude *.pyc
+global-exclude __pycache__
+global-exclude .DS_Store
+global-exclude venv/
+prune venv
