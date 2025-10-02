@@ -36,11 +36,11 @@ jobs:
         
     - name: Test basic import
       run: |
-        python -c "from jobspy_enhanced import scrape_jobs; print('Import successful')"
+        poetry run python -c "from jobspy_enhanced import scrape_jobs; print('Import successful')"
         
     - name: Test scraper imports
       run: |
-        python -c "
+        poetry run python -c "
         from jobspy_enhanced.linkedin import LinkedIn
         from jobspy_enhanced.indeed import Indeed
         from jobspy_enhanced.glassdoor import Glassdoor
@@ -52,7 +52,7 @@ jobs:
         
     - name: Test model imports
       run: |
-        python -c "
+        poetry run python -c "
         from jobspy_enhanced.model import JobType, Location, JobResponse, Country, Site
         print('All model imports successful')
         "
