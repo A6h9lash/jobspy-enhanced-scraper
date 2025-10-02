@@ -1,8 +1,0 @@
-include README.md
-include LICENSE
-include pyproject.toml
-include setup.py
-recursive-include jobspy_enhanced *.py
-recursive-exclude jobspy_enhanced __pycache__
-recursive-exclude jobspy_enhanced *.pyc
-recursive-exclude jobspy_enhanced *.pyo
