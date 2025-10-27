@@ -309,6 +309,7 @@ class ScraperInput(BaseModel):
     is_remote: bool = False
     job_type: JobType | None = None
     easy_apply: bool | None = None
+    experience_level: int | None = None  # 1=Internship, 2=Entry Level, 3=Associate, 4=Mid-Senior level, 5=Director
     offset: int = 0
     linkedin_fetch_description: bool = False
     linkedin_company_ids: list[int] | None = None
