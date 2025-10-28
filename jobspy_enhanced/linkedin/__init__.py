@@ -46,9 +46,11 @@ log = create_logger("LinkedIn")
 
 class LinkedIn(Scraper):
     base_url = "https://www.linkedin.com"
-    delay = 3
-    band_delay = 4
+    delay = 1.5  # Optimized base delay for speed
+    band_delay = 2  # Reduced band delay for faster processing
     jobs_per_page = 25
+    max_retries = 3  # Reduced retries for faster failure handling
+    backoff_multiplier = 1.5  # Less aggressive backoff
 
     def __init__(
         self, proxies: list[str] | str | None = None, ca_cert: str | None = None, user_agent: str | None = None
@@ -69,6 +71,86 @@ class LinkedIn(Scraper):
         self.scraper_input = None
         self.country = "worldwide"
         self.job_url_direct_regex = re.compile(r'(?<=\?url=)[^"]+')
+
+    def _handle_rate_limit(self, attempt: int, max_retries: int = None) -> bool:
+        """
+        Handle rate limiting with exponential backoff and jitter
+        Returns True if should retry, False if max retries exceeded
+        """
+        if max_retries is None:
+            max_retries = self.max_retries
+            
+        if attempt >= max_retries:
+            log.error(f"Max retries ({max_retries}) exceeded for rate limiting")
+            return False
+        
+        # Adjust delays based on rate limit mode
+        rate_limit_mode = getattr(self.scraper_input, 'rate_limit_mode', 'normal') if self.scraper_input else 'normal'
+        
+        if rate_limit_mode == "fast":
+            # Ultra-fast mode for maximum speed
+            base_delay = self.delay * 0.8 * (self.backoff_multiplier ** attempt)
+            jitter = random.uniform(0.9, 1.1)  # Minimal jitter
+        elif rate_limit_mode == "aggressive":
+            # Fast but smart delays for large requests
+            base_delay = self.delay * 1.2 * (self.backoff_multiplier ** attempt)
+            jitter = random.uniform(0.8, 1.2)  # Less jitter for speed
+        elif rate_limit_mode == "conservative":
+            # Conservative delays
+            base_delay = self.delay * 1.5 * (self.backoff_multiplier ** attempt)
+            jitter = random.uniform(0.8, 1.2)
+        else:  # normal
+            base_delay = self.delay * (self.backoff_multiplier ** attempt)
+            jitter = random.uniform(0.7, 1.3)
+            
+        delay = base_delay * jitter
+        
+        # Much lower caps for faster processing
+        if rate_limit_mode == "fast":
+            max_delay = 10  # Very short delays for fast mode
+        elif rate_limit_mode == "aggressive":
+            max_delay = 20
+        else:
+            max_delay = 30
+        delay = min(delay, max_delay)
+        
+        log.warning(f"Rate limited (429). Waiting {delay:.1f} seconds before retry {attempt + 1}/{max_retries} (mode: {rate_limit_mode})")
+        print(f"⏳ Rate limited! Waiting {delay:.1f} seconds before retry {attempt + 1}/{max_retries} (mode: {rate_limit_mode})")
+        
+        time.sleep(delay)
+        return True
+
+    def _make_request_with_retry(self, url: str, params: dict, timeout: int = 10) -> Optional[requests.Response]:
+        """
+        Make a request with automatic retry for rate limiting
+        """
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.get(url, params=params, timeout=timeout)
+                
+                if response.status_code == 429:
+                    if not self._handle_rate_limit(attempt):
+                        return None
+                    continue
+                elif response.status_code not in range(200, 400):
+                    log.error(f"LinkedIn response status code {response.status_code}: {response.text}")
+                    if attempt < self.max_retries:
+                        time.sleep(random.uniform(2, 5))  # Short delay for other errors
+                        continue
+                    return None
+                else:
+                    return response
+                    
+            except Exception as e:
+                log.warning(f"Request attempt {attempt + 1} failed: {str(e)}")
+                if attempt < self.max_retries:
+                    time.sleep(random.uniform(1, 3))
+                    continue
+                else:
+                    log.error(f"All request attempts failed: {str(e)}")
+                    return None
+        
+        return None
 
     def scrape(self, scraper_input: ScraperInput) -> JobResponse:
         """
@@ -126,27 +208,16 @@ class LinkedIn(Scraper):
                 params["f_TPR"] = f"r{seconds_old}"
 
             params = {k: v for k, v in params.items() if v is not None}
-            try:
-                response = self.session.get(
-                    f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search?",
-                    params=params,
-                    timeout=10,
-                )
-                if response.status_code not in range(200, 400):
-                    if response.status_code == 429:
-                        err = (
-                            f"429 Response - Blocked by LinkedIn for too many requests"
-                        )
-                    else:
-                        err = f"LinkedIn response status code {response.status_code}"
-                        err += f" - {response.text}"
-                    log.error(err)
-                    return JobResponse(jobs=job_list)
-            except Exception as e:
-                if "Proxy responded with" in str(e):
-                    log.error(f"LinkedIn: Bad proxy")
-                else:
-                    log.error(f"LinkedIn: {str(e)}")
+            
+            # Use the new retry mechanism for rate limiting
+            response = self._make_request_with_retry(
+                f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search?",
+                params=params,
+                timeout=10
+            )
+            
+            if response is None:
+                log.error("Failed to get response after all retries")
                 return JobResponse(jobs=job_list)
 
             soup = BeautifulSoup(response.text, "html.parser")
@@ -179,7 +250,18 @@ class LinkedIn(Scraper):
                         raise LinkedInException(str(e))
 
             if continue_search():
-                time.sleep(random.uniform(self.delay, self.delay + self.band_delay))
+                # Optimized delay between pages based on rate limit mode
+                rate_limit_mode = getattr(self.scraper_input, 'rate_limit_mode', 'normal') if self.scraper_input else 'normal'
+                
+                if rate_limit_mode == "fast":
+                    delay = random.uniform(0.5, 1.0)  # Very fast
+                elif rate_limit_mode == "aggressive":
+                    delay = random.uniform(1.0, 2.0)  # Fast but safe
+                else:
+                    delay = random.uniform(self.delay, self.delay + self.band_delay)
+                
+                print(f"⏸️  Waiting {delay:.1f} seconds before next page...")
+                time.sleep(delay)
                 start += len(job_cards)
 
         job_list = job_list[: scraper_input.results_wanted]
@@ -302,29 +384,38 @@ class LinkedIn(Scraper):
         :param job_page_url:
         :return: dict
         """
-        # Try multiple times with retry logic for better consistency
-        max_retries = 3
-        for attempt in range(max_retries):
+        # Use the retry mechanism for individual job requests too
+        for attempt in range(self.max_retries + 1):
             try:
                 # Add a small delay between attempts to avoid rate limiting
                 if attempt > 0:
-                    import time
-                    time.sleep(1)
+                    time.sleep(random.uniform(1, 3))
                 
                 response = self.session.get(
                     f"{self.base_url}/jobs/view/{job_id}", timeout=10
                 )
-                response.raise_for_status()
+                
+                if response.status_code == 429:
+                    if not self._handle_rate_limit(attempt):
+                        return {}
+                    continue
+                elif response.status_code not in range(200, 400):
+                    log.warning(f"Job {job_id}: HTTP {response.status_code}")
+                    if attempt < self.max_retries:
+                        continue
+                    return {}
                 
                 if "linkedin.com/signup" in response.url:
                     log.warning(f"Job {job_id}: Redirected to signup page")
-                    continue
+                    if attempt < self.max_retries:
+                        continue
+                    return {}
                 
                 soup = BeautifulSoup(response.text, "html.parser")
                 
                 # Check if we got the full page content by looking for the applyUrl element
                 code_element = soup.find("code", id="applyUrl")
-                if not code_element and attempt < max_retries - 1:
+                if not code_element and attempt < self.max_retries:
                     log.warning(f"Job {job_id}: Attempt {attempt + 1} - No applyUrl element found, retrying...")
                     continue
                 
@@ -333,10 +424,11 @@ class LinkedIn(Scraper):
                 
             except Exception as e:
                 log.warning(f"Job {job_id}: Attempt {attempt + 1} failed - {str(e)}")
-                if attempt == max_retries - 1:
+                if attempt < self.max_retries:
+                    continue
+                else:
                     log.error(f"Job {job_id}: All attempts failed, returning empty details")
                     return {}
-                continue
         else:
             # If we exit the loop without breaking, all attempts failed
             return {}

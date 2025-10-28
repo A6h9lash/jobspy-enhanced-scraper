@@ -48,6 +48,7 @@ def scrape_jobs(
     enforce_annual_salary: bool = False,
     verbose: int = 0,
     user_agent: str = None,
+    rate_limit_mode: str = "normal",
     **kwargs,
 ) -> pd.DataFrame:
     """
@@ -97,6 +98,7 @@ def scrape_jobs(
         linkedin_company_ids=linkedin_company_ids,
         offset=offset,
         hours_old=hours_old,
+        rate_limit_mode=rate_limit_mode,
     )
 
     def scrape_site(site: Site) -> Tuple[str, JobResponse]:

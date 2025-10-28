@@ -316,6 +316,7 @@ class ScraperInput(BaseModel):
     description_format: DescriptionFormat | None = DescriptionFormat.MARKDOWN
 
     request_timeout: int = 60
+    rate_limit_mode: str = "normal"  # "fast", "normal", "conservative", "aggressive"
 
     results_wanted: int = 15
     hours_old: int | None = None
