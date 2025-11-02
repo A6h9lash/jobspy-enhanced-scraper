@@ -450,16 +450,16 @@ class LinkedIn(Scraper):
                     for job_card, job_id in page_job_cards:
                         try:
                             job_post = self._process_job(job_card, job_id, False)
-                        if job_post:
-                            job_list.append(job_post)
+                            if job_post:
+                                job_list.append(job_post)
                                 print(f"   ✅ Job {len(job_list)}: {job_post.title} at {job_post.company_name}")
                             else:
                                 print(f"   ⏭️  Job filtered out (likely easy apply)")
-                        if not continue_search():
-                            break
-                    except Exception as e:
+                            if not continue_search():
+                                break
+                        except Exception as e:
                             print(f"   ❌ Error processing job {job_id}: {str(e)}")
-                        raise LinkedInException(str(e))
+                            raise LinkedInException(str(e))
 
             if continue_search():
                 # Optimized delay between pages based on rate limit mode (slightly grows with pages)
