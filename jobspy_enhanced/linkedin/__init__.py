@@ -1167,7 +1167,7 @@ class LinkedIn(Scraper):
                         time.sleep(random.uniform(0.5, 1.5))
                         continue
                     else:
-                    log.warning(f"Job {job_id}: View-source fetch returned {response.status_code}")
+                        log.warning(f"Job {job_id}: View-source fetch returned {response.status_code}")
                     
             except Exception as e:
                 log.warning(f"Job {job_id}: View-source fetch attempt {attempt + 1} failed - {str(e)}")
