@@ -1,3 +1,4 @@
+free-proxy>=1.1.1
 # JobSpy Enhanced Scraper - Requirements
 # Core dependencies for the enhanced job scraper
 

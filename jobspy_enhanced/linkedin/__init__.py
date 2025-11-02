@@ -6,6 +6,8 @@ import time
 from datetime import datetime, date
 from typing import Optional
 from urllib.parse import urlparse, urlunparse, unquote
+from urllib.parse import parse_qs
+import requests
 
 import regex as re
 from bs4 import BeautifulSoup
@@ -71,6 +73,33 @@ class LinkedIn(Scraper):
         self.scraper_input = None
         self.country = "worldwide"
         self.job_url_direct_regex = re.compile(r'(?<=\?url=)[^"]+')
+        # dynamic proxy state
+        self._current_proxy: str | None = None
+        # externalApply rate limiter timestamps
+        self._ext_apply_calls: list[float] = []
+
+    # optional free proxy provider
+    def _rotate_proxy(self) -> None:
+        """Rotate to a fresh free proxy (US preferred), best-effort."""
+        try:
+            from fp.fp import FreeProxy  # type: ignore[import-not-found]
+        except Exception:
+            return
+        try:
+            proxy_url = None
+            try:
+                proxy_url = FreeProxy(country_id=['US'], rand=True, timeout=3).get()
+            except Exception:
+                proxy_url = FreeProxy(rand=True, timeout=3).get()
+            if proxy_url:
+                self._current_proxy = proxy_url
+                self.session.proxies = {"http": proxy_url, "https": proxy_url}
+                try:
+                    self.session.cookies.clear()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _handle_rate_limit(self, attempt: int, max_retries: int = None) -> bool:
         """
@@ -120,21 +149,22 @@ class LinkedIn(Scraper):
         time.sleep(delay)
         return True
 
-    def _make_request_with_retry(self, url: str, params: dict, timeout: int = 10) -> Optional[requests.Response]:
+    def _make_request_with_retry(self, url: str, params: dict, timeout: int = 10, max_retries: Optional[int] = None) -> Optional[requests.Response]:
         """
         Make a request with automatic retry for rate limiting
         """
-        for attempt in range(self.max_retries + 1):
+        retries = self.max_retries if max_retries is None else max_retries
+        for attempt in range(retries + 1):
             try:
                 response = self.session.get(url, params=params, timeout=timeout)
                 
                 if response.status_code == 429:
-                    if not self._handle_rate_limit(attempt):
+                    if not self._handle_rate_limit(attempt, max_retries=retries):
                         return None
                     continue
                 elif response.status_code not in range(200, 400):
                     log.error(f"LinkedIn response status code {response.status_code}: {response.text}")
-                    if attempt < self.max_retries:
+                    if attempt < retries:
                         time.sleep(random.uniform(2, 5))  # Short delay for other errors
                         continue
                     return None
@@ -143,7 +173,7 @@ class LinkedIn(Scraper):
                     
             except Exception as e:
                 log.warning(f"Request attempt {attempt + 1} failed: {str(e)}")
-                if attempt < self.max_retries:
+                if attempt < retries:
                     time.sleep(random.uniform(1, 3))
                     continue
                 else:
@@ -151,6 +181,70 @@ class LinkedIn(Scraper):
                     return None
         
         return None
+
+    def _throttle(self, bucket: list[float], max_per_sec: int) -> None:
+        """Simple token-bucket-like throttle: sleep if over max_per_sec in last 1s."""
+        now = time.time()
+        # keep only last 1s
+        while bucket and now - bucket[0] > 1.0:
+            bucket.pop(0)
+        if len(bucket) >= max_per_sec:
+            time.sleep(0.08)
+        bucket.append(time.time())
+
+    def _fetch_page_cards(self, base_params: dict, start: int) -> list[tuple[Tag, str]]:
+        """Fetch one page of job cards for a given start offset with reduced retries."""
+        params = dict(base_params)
+        params["start"] = start
+        # Throttle page requests to ~4/sec
+        if not hasattr(self, "_page_calls"):
+            self._page_calls = []
+        attempts = 2
+        out: list[tuple[Tag, str]] = []
+        for att in range(attempts):
+            self._throttle(self._page_calls, 4)
+            print(f"   🔎 Fetch page start={start} attempt={att+1}")
+            resp = self._make_request_with_retry(
+                f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search?",
+                params=params,
+                timeout=8,
+                max_retries=1,
+            )
+            if not resp:
+                # rotate proxy on hard failure and retry once
+                self._rotate_proxy()
+                time.sleep(0.2)
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Primary selector
+            job_cards = soup.find_all("div", class_="base-search-card")
+            # Fallback selector (variation)
+            if not job_cards:
+                job_cards = soup.find_all("div", class_="base-card")
+            # Build unique within this page
+            page_ids = set()
+            out = []
+            for job_card in job_cards:
+                href_tag = job_card.find("a", class_="base-card__full-link")
+                if not (href_tag and "href" in href_tag.attrs):
+                    continue
+                href = href_tag.attrs["href"].split("?")[0]
+                job_id = href.split("-")[-1]
+                if job_id in page_ids:
+                    continue
+                page_ids.add(job_id)
+                out.append((job_card, job_id))
+            # Enforce 25 per page target: retry if short on first attempt
+            if len(out) >= 25:
+                return out[:25]
+            if att == 0 and len(out) < 25:
+                # rotate and retry to recover soft wall
+                self._rotate_proxy()
+                time.sleep(0.25)
+                continue
+            break
+        # Return whatever we have (may be <25 if LinkedIn returned fewer twice)
+        return out[:25]
 
     def scrape(self, scraper_input: ScraperInput) -> JobResponse:
         """
@@ -169,6 +263,97 @@ class LinkedIn(Scraper):
         continue_search = (
             lambda: len(job_list) < scraper_input.results_wanted and start < 1000
         )
+        # Optimized branch: sequential card collection + parallel detail processing
+        # Apply to all cases where descriptions are needed (not just >= 300)
+        if scraper_input.linkedin_fetch_description:
+            # Build base params once
+            base_params = {
+                "keywords": scraper_input.search_term,
+                "location": scraper_input.location,
+                "distance": scraper_input.distance,
+                "pageNum": 0,
+            }
+            if scraper_input.is_remote:
+                base_params["f_WT"] = 2
+            if scraper_input.job_type:
+                base_params["f_JT"] = job_type_code(scraper_input.job_type)
+            if scraper_input.easy_apply is not None:
+                base_params["f_AL"] = "true" if scraper_input.easy_apply else "false"
+            if scraper_input.linkedin_company_ids:
+                base_params["f_C"] = ",".join(map(str, scraper_input.linkedin_company_ids))
+            if scraper_input.experience_level is not None:
+                base_params["f_E"] = scraper_input.experience_level
+            if seconds_old is not None:
+                base_params["f_TPR"] = f"r{seconds_old}"
+
+            # Step 1: Collect ALL job cards sequentially until results_wanted is reached
+            print("🧩 Collecting job cards sequentially...")
+            collected: list[tuple[Tag, str]] = []
+            collected_ids: set[str] = set()
+            current_start = start
+            
+            while len(collected) < scraper_input.results_wanted:
+                page_cards = self._fetch_page_cards(base_params, current_start)
+                
+                if not page_cards:
+                    # No more jobs available
+                    break
+                
+                # Add new cards (avoid duplicates)
+                for jc, jid in page_cards:
+                    if jid in collected_ids:
+                        continue
+                    collected_ids.add(jid)
+                    collected.append((jc, jid))
+                    if len(collected) >= scraper_input.results_wanted:
+                        break
+                
+                if len(collected) >= scraper_input.results_wanted:
+                    break
+                
+                # Move to next page
+                current_start += 25
+                
+                # Small delay between page fetches (respects rate_limit_mode)
+                rate_limit_mode = getattr(scraper_input, 'rate_limit_mode', 'normal') if scraper_input else 'normal'
+                if rate_limit_mode == "fast":
+                    time.sleep(random.uniform(0.2, 0.5))
+                elif rate_limit_mode == "aggressive":
+                    time.sleep(random.uniform(0.4, 0.8))
+                else:
+                    time.sleep(random.uniform(0.5, 1.0))
+            
+            # Trim to exactly results_wanted
+            collected = collected[:scraper_input.results_wanted]
+            print(f"✅ Collected {len(collected)} job cards. Now fetching details...")
+            
+            # Step 2: Process ALL collected job cards in parallel batches
+            if collected:
+                print(f"🧪 Processing details in batches... ({len(collected)} cards)")
+                batch_size = 100
+                # Adjust workers based on rate_limit_mode
+                rate_limit_mode = getattr(scraper_input, 'rate_limit_mode', 'normal') if scraper_input else 'normal'
+                if rate_limit_mode == "fast":
+                    max_workers = 8  # Reduced workers to avoid 429s (was 14, too aggressive)
+                elif rate_limit_mode == "aggressive":
+                    max_workers = 10
+                else:
+                    max_workers = 8  # Conservative to avoid rate limits
+                for i in range(0, len(collected), batch_size):
+                    batch = collected[i:i + batch_size]
+                    posts = self._fetch_job_batch_parallel(batch, max_workers=max_workers)
+                    for jp in posts:
+                        if jp:
+                            job_list.append(jp)
+                            print(f"   ✅ Job {len(job_list)}: {jp.title} at {jp.company_name}")
+                            if not continue_search():
+                                break
+                    if not continue_search():
+                        break
+            
+            job_list = job_list[:scraper_input.results_wanted]
+            return JobResponse(jobs=job_list)
+
         while continue_search():
             request_count += 1
             log.info(
@@ -211,8 +396,8 @@ class LinkedIn(Scraper):
             
             # Use the new retry mechanism for rate limiting
             response = self._make_request_with_retry(
-                f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search?",
-                params=params,
+                    f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search?",
+                    params=params,
                 timeout=10
             )
             
@@ -225,40 +410,72 @@ class LinkedIn(Scraper):
             if len(job_cards) == 0:
                 return JobResponse(jobs=job_list)
 
+            # Collect cards and IDs for this page
+            page_job_cards: list[tuple[Tag, str]] = []
             for job_card in job_cards:
                 href_tag = job_card.find("a", class_="base-card__full-link")
-                if href_tag and "href" in href_tag.attrs:
+                if not (href_tag and "href" in href_tag.attrs):
+                    continue
                     href = href_tag.attrs["href"].split("?")[0]
                     job_id = href.split("-")[-1]
-
                     if job_id in seen_ids:
                         continue
                     seen_ids.add(job_id)
+                page_job_cards.append((job_card, job_id))
 
-                    try:
-                        fetch_desc = scraper_input.linkedin_fetch_description
-                        job_post = self._process_job(job_card, job_id, fetch_desc)
+            if page_job_cards:
+                if scraper_input.linkedin_fetch_description:
+                    # Parallel, guarded fetching in small batches
+                    batch_size = 16
+                    # Adjust workers based on rate_limit_mode (reduce for fast to avoid 429s)
+                    rate_limit_mode = getattr(scraper_input, 'rate_limit_mode', 'normal') if scraper_input else 'normal'
+                    if rate_limit_mode == "fast":
+                        batch_workers = 6  # Reduced to avoid 429s (was 10, too aggressive)
+                    elif rate_limit_mode == "aggressive":
+                        batch_workers = 7
+                    else:
+                        batch_workers = 6  # Conservative to avoid rate limits
+                    for i in range(0, len(page_job_cards), batch_size):
+                        batch = page_job_cards[i:i + batch_size]
+                        posts = self._fetch_job_batch_parallel(batch, max_workers=batch_workers)
+                        for jp in posts:
+                            job_list.append(jp)
+                            print(f"   ✅ Job {len(job_list)}: {jp.title} at {jp.company_name}")
+                            if not continue_search():
+                                break
+                        if not continue_search():
+                            break
+                else:
+                    # No description path: use existing lightweight processing
+                    for job_card, job_id in page_job_cards:
+                        try:
+                            job_post = self._process_job(job_card, job_id, False)
                         if job_post:
                             job_list.append(job_post)
-                            print(f"   ✅ Job {len(job_list)}: {job_post.title} at {job_post.company_name}")
-                        else:
-                            print(f"   ⏭️  Job filtered out (likely easy apply)")
+                                print(f"   ✅ Job {len(job_list)}: {job_post.title} at {job_post.company_name}")
+                            else:
+                                print(f"   ⏭️  Job filtered out (likely easy apply)")
                         if not continue_search():
                             break
                     except Exception as e:
-                        print(f"   ❌ Error processing job {job_id}: {str(e)}")
+                            print(f"   ❌ Error processing job {job_id}: {str(e)}")
                         raise LinkedInException(str(e))
 
             if continue_search():
-                # Optimized delay between pages based on rate limit mode
+                # Optimized delay between pages based on rate limit mode (slightly grows with pages)
                 rate_limit_mode = getattr(self.scraper_input, 'rate_limit_mode', 'normal') if self.scraper_input else 'normal'
                 
+                # Reduce page_factor for fast mode
                 if rate_limit_mode == "fast":
-                    delay = random.uniform(0.5, 1.0)  # Very fast
-                elif rate_limit_mode == "aggressive":
-                    delay = random.uniform(1.0, 2.0)  # Fast but safe
+                    page_factor = min(0.2, request_count * 0.01)  # add up to +0.2s over pages for fast mode
                 else:
-                    delay = random.uniform(self.delay, self.delay + self.band_delay)
+                    page_factor = min(0.5, request_count * 0.02)  # add up to +0.5s over pages
+                if rate_limit_mode == "fast":
+                    delay = random.uniform(0.3, 0.7) + page_factor  # Reduced from 0.5-1.0 for faster mode
+                elif rate_limit_mode == "aggressive":
+                    delay = random.uniform(0.8, 1.5) + page_factor  # Reduced from 1.0-2.0
+                else:
+                    delay = random.uniform(self.delay, self.delay + self.band_delay) + page_factor
                 
                 print(f"⏸️  Waiting {delay:.1f} seconds before next page...")
                 time.sleep(delay)
@@ -380,59 +597,88 @@ class LinkedIn(Scraper):
 
     def _get_job_details(self, job_id: str) -> dict:
         """
-        Retrieves job description and other job details by going to the job page url
-        :param job_page_url:
+        Retrieves job description and other job details by going to the job page url.
+        
+        Phase 1: Fetches view-source:https://www.linkedin.com/jobs/view/{job_id} (raw HTML)
+        Phase 2: Uses multiple extraction methods with retries
+        
+        :param job_id: LinkedIn job ID
         :return: dict
         """
-        # Use the retry mechanism for individual job requests too
-        for attempt in range(self.max_retries + 1):
+        # Phase 1: Initial Page Fetch (view-source style - raw HTML)
+        # Adjust retries based on rate_limit_mode
+        rate_limit_mode = getattr(self.scraper_input, 'rate_limit_mode', 'normal') if self.scraper_input else 'normal'
+        if rate_limit_mode == "fast":
+            detail_max_retries = 0  # No retry for fast mode - fail fast
+        else:
+            detail_max_retries = 1
+        job_url_direct_pre: str | None = None
+        soup: BeautifulSoup | None = None
+        response_text: str = ""
+        
+        for attempt in range(detail_max_retries + 1):
             try:
-                # Add a small delay between attempts to avoid rate limiting
-                if attempt > 0:
-                    time.sleep(random.uniform(1, 3))
+                # rotate proxy for each attempt (helps with 429 errors)
+                self._rotate_proxy()
                 
+                # Fetch view-source style (raw HTML) - HTTP GET already returns raw HTML
+                # Setting Accept header to ensure we get HTML content
+                headers = {'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}
                 response = self.session.get(
-                    f"{self.base_url}/jobs/view/{job_id}", timeout=10
+                    f"{self.base_url}/jobs/view/{job_id}", 
+                    timeout=8,
+                    headers=headers
                 )
                 
                 if response.status_code == 429:
-                    if not self._handle_rate_limit(attempt):
-                        return {}
-                    continue
+                    # Only retry on 429 if we have attempts left and not in fast mode
+                    if attempt < detail_max_retries:
+                        # Shorter delays for fast mode (if retry allowed)
+                        if rate_limit_mode == "fast":
+                            time.sleep(random.uniform(0.3, 0.8))
+                        elif rate_limit_mode == "aggressive":
+                            time.sleep(random.uniform(0.4, 1.0))
+                        else:
+                            time.sleep(random.uniform(0.5, 1.5))
+                        continue
+                    # In fast mode, return empty on 429 to fail fast
+                    return {}
                 elif response.status_code not in range(200, 400):
                     log.warning(f"Job {job_id}: HTTP {response.status_code}")
-                    if attempt < self.max_retries:
+                    if attempt < detail_max_retries:
+                        time.sleep(random.uniform(0.3, 0.8))
                         continue
                     return {}
                 
                 if "linkedin.com/signup" in response.url:
                     log.warning(f"Job {job_id}: Redirected to signup page")
-                    if attempt < self.max_retries:
-                        continue
+                    if attempt < detail_max_retries:
+                        time.sleep(random.uniform(0.3, 0.8))
+                    continue
                     return {}
                 
-                soup = BeautifulSoup(response.text, "html.parser")
-                
-                # Check if we got the full page content by looking for the applyUrl element
-                code_element = soup.find("code", id="applyUrl")
-                if not code_element and attempt < self.max_retries:
-                    log.warning(f"Job {job_id}: Attempt {attempt + 1} - No applyUrl element found, retrying...")
-                    continue
-                
-                # If we get here, we have a valid response
+                # Successfully fetched page - parse immediately
+                response_text = response.text
+                soup = BeautifulSoup(response_text, "html.parser")
+                # Extract direct URL from raw HTML first (fastest, most reliable)
+                job_url_direct_pre = self._extract_job_url_direct_from_raw(response_text, job_id)
+                # If we got the page successfully, break (don't retry for "no applyUrl" - we'll try other methods later)
                 break
                 
             except Exception as e:
                 log.warning(f"Job {job_id}: Attempt {attempt + 1} failed - {str(e)}")
-                if attempt < self.max_retries:
-                    continue
-                else:
-                    log.error(f"Job {job_id}: All attempts failed, returning empty details")
-                    return {}
+                if attempt < detail_max_retries:
+                    time.sleep(random.uniform(0.3, 0.8))
+                continue
         else:
-            # If we exit the loop without breaking, all attempts failed
+            log.error(f"Job {job_id}: All attempts failed, returning empty details")
             return {}
 
+        # If we couldn't fetch the page at all, return empty
+        if soup is None:
+            return {}
+
+        # Extract job description and other details from HTML
         div_content = soup.find(
             "div", class_=lambda x: x and "show-more-less-html__markup" in x
         )
@@ -462,8 +708,105 @@ class LinkedIn(Scraper):
             else None
         )
         
-        # Extract direct URL with retry logic
-        job_url_direct = self._parse_job_url_direct_with_retry(soup, job_id)
+        # Phase 2: Extraction Methods (In Order)
+        # Method 1: Raw HTML extraction using job posting API
+        job_url_direct = job_url_direct_pre  # From Phase 1
+        if not job_url_direct:
+            # Try job posting API for raw HTML extraction
+            api_html = self._fetch_job_posting_api(job_id)
+            if api_html:
+                job_url_direct = self._extract_job_url_direct_from_raw(api_html, job_id)
+                if job_url_direct:
+                    log.info(f"Job {job_id}: Direct URL found via job posting API")
+        
+        # Method 2: DOM parsing (fast, no network call)
+        if not job_url_direct:
+            job_url_direct = self._parse_job_url_direct(soup)
+        
+        # Method 3: Re-check raw HTML if DOM failed (safety check)
+        if not job_url_direct:
+            job_url_direct = self._extract_job_url_direct_from_raw(response_text, job_id)
+        
+        # Method 4: Page retry with proxy rotation (fewer retries for fast mode)
+        if not job_url_direct:
+            log.warning(f"Job {job_id}: No direct URL found, attempting retry...")
+            # Adjust retries based on rate_limit_mode
+            rate_limit_mode = getattr(self.scraper_input, 'rate_limit_mode', 'normal') if self.scraper_input else 'normal'
+            if rate_limit_mode == "fast":
+                max_retries = 1  # Only 1 retry for fast mode (2 total attempts)
+            elif rate_limit_mode == "aggressive":
+                max_retries = 2
+            else:
+                max_retries = 3
+            for retry_attempt in range(max_retries):
+                try:
+                    # Shorter delays for fast mode
+                    if rate_limit_mode == "fast":
+                        time.sleep(random.uniform(0.1, 0.3))
+                    elif rate_limit_mode == "aggressive":
+                        time.sleep(random.uniform(0.2, 0.4))
+                    else:
+                        time.sleep(random.uniform(0.3, 0.5))
+                    # Rotate proxy before retry
+                    self._rotate_proxy()
+                    # Fetch the page again (view-source style)
+                    headers = {'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}
+                    retry_response = self.session.get(
+                        f"{self.base_url}/jobs/view/{job_id}", 
+                        timeout=8,
+                        headers=headers
+                    )
+                    if retry_response.status_code == 200 and "linkedin.com/signup" not in retry_response.url:
+                        retry_soup = BeautifulSoup(retry_response.text, "html.parser")
+                        # Try raw HTML extraction first
+                        job_url_direct = self._extract_job_url_direct_from_raw(retry_response.text, job_id)
+                        # Then try DOM parsing
+                        if not job_url_direct:
+                            job_url_direct = self._parse_job_url_direct(retry_soup)
+                        
+                        if job_url_direct:
+                            log.info(f"Job {job_id}: Direct URL found on retry attempt {retry_attempt + 1}: {job_url_direct}")
+                            break
+                        else:
+                            log.warning(f"Job {job_id}: Retry attempt {retry_attempt + 1} - still no direct URL found")
+                    else:
+                        log.warning(f"Job {job_id}: Retry attempt {retry_attempt + 1} - failed to fetch page")
+                except Exception as e:
+                    log.warning(f"Job {job_id}: Retry attempt {retry_attempt + 1} failed - {str(e)}")
+        
+        # Method 5: ExternalApply endpoint with view-source fetch (fewer retries for fast mode)
+        if not job_url_direct or (job_url_direct and 'linkedin.com' in job_url_direct.lower()):
+            # Adjust retries based on rate_limit_mode
+            rate_limit_mode = getattr(self.scraper_input, 'rate_limit_mode', 'normal') if self.scraper_input else 'normal'
+            if rate_limit_mode == "fast":
+                max_ext_retries = 1  # Only 1 retry for fast mode (2 total attempts)
+            elif rate_limit_mode == "aggressive":
+                max_ext_retries = 2
+            else:
+                max_ext_retries = 3
+            for ext_retry in range(max_ext_retries):
+                try:
+                    if ext_retry > 0:
+                        # Shorter delays for fast mode
+                        if rate_limit_mode == "fast":
+                            time.sleep(random.uniform(0.3, 0.6))
+                        elif rate_limit_mode == "aggressive":
+                            time.sleep(random.uniform(0.4, 0.8))
+                        else:
+                            time.sleep(random.uniform(0.5, 1.0))
+                        self._rotate_proxy()
+                    
+                    # Fetch view-source style for externalApply endpoint
+                    ext_url = self._extract_job_url_direct_from_external_apply_with_view_source(job_id)
+                    if ext_url and 'linkedin.com' not in ext_url.lower():
+                        # Got a valid external URL - use it
+                        job_url_direct = ext_url
+                        log.info(f"Job {job_id}: Direct URL found via externalApply with view-source (attempt {ext_retry + 1}): {job_url_direct}")
+                        break
+                except Exception as e:
+                    log.warning(f"Job {job_id}: externalApply attempt {ext_retry + 1} failed - {str(e)}")
+                    if ext_retry < max_ext_retries - 1:
+                        continue
         
         # Detect if this is an easy apply job from the job page
         is_easy_apply = self._is_easy_apply_job_from_page(soup)
@@ -483,6 +826,106 @@ class LinkedIn(Scraper):
             "job_function": job_function,
             "is_easy_apply": is_easy_apply,
         }
+
+    def _process_job_card_with_details(self, job_card: Tag, job_id: str, details: dict) -> Optional[JobPost]:
+        """Build a JobPost from a card and a pre-fetched details dict."""
+        title_tag = job_card.find("span", class_="sr-only")
+        title = title_tag.get_text(strip=True) if title_tag else "N/A"
+
+        company_tag = job_card.find("h4", class_="base-search-card__subtitle")
+        company_a_tag = company_tag.find("a") if company_tag else None
+        company_url = (
+            urlunparse(urlparse(company_a_tag.get("href"))._replace(query=""))
+            if company_a_tag and company_a_tag.has_attr("href")
+            else ""
+        )
+        company = company_a_tag.get_text(strip=True) if company_a_tag else "N/A"
+
+        # Prefer page-derived company fields
+        if details.get("company_name"):
+            company = details["company_name"]
+        if details.get("company_url"):
+            company_url = details["company_url"]
+
+        metadata_card = job_card.find("div", class_="base-search-card__metadata")
+        location = self._get_location(metadata_card)
+
+        date_posted = None
+        if metadata_card:
+            datetime_tag = metadata_card.find("time", attrs={"datetime": True})
+            if datetime_tag and "datetime" in datetime_tag.attrs:
+                datetime_str = datetime_tag["datetime"]
+                try:
+                    for fmt in ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%SZ"]:
+                        try:
+                            date_posted = datetime.strptime(datetime_str, fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                except:
+                    date_posted = None
+
+        # Filter easy apply if requested
+        if details.get("is_easy_apply") and self.scraper_input and self.scraper_input.easy_apply is False:
+            return None
+
+        # Note: job_url_direct is already extracted efficiently in _get_job_details
+        # No need for redundant fallback here - it would just add latency
+
+        description = details.get("description")
+        is_remote = is_job_remote(title, description, location)
+
+        return JobPost(
+            id=f"li-{job_id}",
+            title=title,
+            company_name=company,
+            company_url=company_url,
+            location=location,
+            is_remote=is_remote,
+            date_posted=date_posted,
+            job_url=f"{self.base_url}/jobs/view/{job_id}",
+            compensation=None,
+            job_type=details.get("job_type"),
+            job_level=details.get("job_level", "").lower(),
+            company_industry=details.get("company_industry"),
+            description=description,
+            job_url_direct=details.get("job_url_direct"),
+            emails=extract_emails_from_text(description),
+            company_logo=details.get("company_logo"),
+            job_function=details.get("job_function"),
+        )
+
+    def _fetch_job_batch_parallel(self, job_cards: list[tuple[Tag, str]], max_workers: int = 8) -> list[JobPost]:
+        """Fetch details for a batch of job cards in parallel with jitter and proxy rotation.
+        Optimized: Reduced workers when using free proxies to avoid rate limits.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results: list[JobPost] = []
+
+        # Reduce workers if using free proxies (they're slower and cause more 429s)
+        # Original design was 16 workers, but free proxies can't handle that load
+        if self._current_proxy is not None:  # Using free proxies
+            max_workers = min(max_workers, 10)  # Cap at 10 for free proxies
+        
+        def worker(job_card: Tag, job_id: str) -> Optional[JobPost]:
+            try:
+                # Minimal jitter to avoid bursts
+                time.sleep(random.uniform(0.02, 0.05))
+                details = self._get_job_details(job_id)
+                if details is None or not details:
+                    return None
+                return self._process_job_card_with_details(job_card, job_id, details)
+            except Exception as e:
+                log.debug(f"Worker exception for job {job_id}: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {ex.submit(worker, jc, jid): (jc, jid) for jc, jid in job_cards}
+            for fut in as_completed(future_map):
+                jp = fut.result()
+                if jp:
+                    results.append(jp)
+        return results
 
     def _get_location(self, metadata_card: Optional[Tag]) -> Location:
         """
@@ -622,51 +1065,220 @@ class LinkedIn(Scraper):
 
         return job_url_direct
 
-    def _parse_job_url_direct_with_retry(self, soup: BeautifulSoup, job_id: str) -> str | None:
+    def _fetch_job_posting_api(self, job_id: str) -> str | None:
         """
-        Parse job URL direct with retry logic for better consistency
-        :param soup: BeautifulSoup object of the job page
-        :param job_id: Job ID for logging
-        :return: Direct URL or None
+        Fetch job details from the LinkedIn job posting API endpoint.
+        Returns raw HTML response text if successful, None otherwise.
+        
+        Endpoint: /jobs-guest/jobs/api/jobPosting/{job_id}
+        :param job_id: LinkedIn job ID
+        :return: Raw HTML string or None
         """
-        # First try the normal method
-        direct_url = self._parse_job_url_direct(soup)
+        try:
+            # Try to fetch from job posting API
+            api_url = f"{self.base_url}/jobs-guest/jobs/api/jobPosting/{job_id}"
+            response = self.session.get(api_url, timeout=8)
+            
+            if response.status_code == 200:
+                # Check if response is HTML (API might return HTML even though it's an API endpoint)
+                content_type = response.headers.get('Content-Type', '').lower()
+                if 'html' in content_type or response.text:
+                    return response.text
+            elif response.status_code == 429:
+                log.warning(f"Job {job_id}: API rate limited (429)")
+            else:
+                log.debug(f"Job {job_id}: API returned status {response.status_code}")
+        except Exception as e:
+            log.debug(f"Job {job_id}: Error fetching API - {str(e)}")
         
-        if direct_url:
-            log.debug(f"Job {job_id}: Direct URL found on first attempt: {direct_url}")
-            return direct_url
-        
-        # If no direct URL found, try refreshing the page and parsing again
-        log.warning(f"Job {job_id}: No direct URL found, attempting retry...")
-        
-        max_retries = 2
-        for attempt in range(max_retries):
+        return None
+
+    def _extract_job_url_direct_from_raw(self, raw_html: str, job_id: str) -> str | None:
+        """
+        Extract job_url_direct by scanning the raw HTML (equivalent to view-source) for
+        the applyUrl code block and parsing the url=... value inside the comment.
+        """
+        try:
+            # Prefer exact match with style="display: none"
+            block_match = re.search(r'<code\s+id="applyUrl"\s+style="display:\s*none"[\s\S]*?</code>', raw_html, re.IGNORECASE)
+            if not block_match:
+                # Fallback: any applyUrl code block
+                block_match = re.search(r'<code\s+id="applyUrl"[\s\S]*?</code>', raw_html, re.IGNORECASE)
+            if not block_match:
+                # Last-resort: search for externalApply/{job_id}?url=... directly
+                ea = re.search(rf'externalApply/{job_id}\?url=([^&"\s>]+)', raw_html, re.IGNORECASE)
+                if ea:
+                    return unquote(ea.group(1)).split('&urlHash=')[0]
+                return None
+            block = block_match.group(0)
+            # Pull out the commented string contents if present
+            comment_match = re.search(r'<!--\s*"(https?://[^"]+)"\s*-->', block)
+            if comment_match:
+                commented_url = comment_match.group(1)
+                # From the commented externalApply URL, prefer the url= param if present
+                # e.g. ...externalApply/{id}?url=<ENCODED>&urlHash=...
+                url_param_match = re.search(r'url=([^&\s]+)', commented_url)
+                if url_param_match:
+                    encoded = url_param_match.group(1)
+                    direct = unquote(encoded)
+                    # skip linkedin internal
+                    # direct target can be any external domain; if it happens to include linkedin.com (rare), still prefer decoding
+                    return direct.split('&urlHash=')[0]
+                # If no url= param, and the commented_url itself is non-LinkedIn, accept it
+                if not re.search(r'linkedin\.com', commented_url, re.IGNORECASE):
+                    return commented_url
+            # Fallback: search raw for url=... pattern near applyUrl
+            url_near_match = re.search(r'applyUrl[\s\S]{0,400}url=([^"&\s>]+)', block, re.IGNORECASE)
+            if url_near_match:
+                return unquote(url_near_match.group(1)).split('&urlHash=')[0]
+        except Exception:
+            pass
+        return None
+
+    def _extract_job_url_direct_from_external_apply_with_view_source(self, job_id: str) -> str | None:
+        """
+        Fetch view-source:https://www.linkedin.com/jobs/view/{job_id} and extract direct URL.
+        Searches for <code id="applyUrl" style="display: none"> in raw HTML.
+        Extracts URL from HTML comments: <!--"externalApply/123?url=ENCODED"-->
+        Up to 2 attempts (1 retry) with proxy rotation.
+        """
+        detail_max_retries = 1
+        for attempt in range(detail_max_retries + 1):
             try:
-                # Add a small delay
-                import time
-                time.sleep(0.5)
+                if attempt > 0:
+                    time.sleep(random.uniform(0.3, 0.5))
+                    self._rotate_proxy()
                 
-                # Fetch the page again
+                # Fetch view-source style (raw HTML)
+                headers = {'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'}
                 response = self.session.get(
-                    f"{self.base_url}/jobs/view/{job_id}", timeout=10
+                    f"{self.base_url}/jobs/view/{job_id}", 
+                    timeout=8,
+                    headers=headers
                 )
                 
                 if response.status_code == 200 and "linkedin.com/signup" not in response.url:
-                    soup_retry = BeautifulSoup(response.text, "html.parser")
-                    direct_url_retry = self._parse_job_url_direct(soup_retry)
-                    
-                    if direct_url_retry:
-                        log.info(f"Job {job_id}: Direct URL found on retry attempt {attempt + 1}: {direct_url_retry}")
-                        return direct_url_retry
+                    # Extract direct URL from raw HTML
+                    job_url_direct = self._extract_job_url_direct_from_raw(response.text, job_id)
+                    if job_url_direct:
+                        return job_url_direct
+                elif response.status_code == 429:
+                    if attempt < detail_max_retries:
+                        time.sleep(random.uniform(0.5, 1.5))
+                        continue
                     else:
-                        log.warning(f"Job {job_id}: Retry attempt {attempt + 1} - still no direct URL found")
-                else:
-                    log.warning(f"Job {job_id}: Retry attempt {attempt + 1} - failed to fetch page")
+                    log.warning(f"Job {job_id}: View-source fetch returned {response.status_code}")
                     
             except Exception as e:
-                log.warning(f"Job {job_id}: Retry attempt {attempt + 1} failed - {str(e)}")
+                log.warning(f"Job {job_id}: View-source fetch attempt {attempt + 1} failed - {str(e)}")
+                if attempt < detail_max_retries:
+                    continue
         
-        log.warning(f"Job {job_id}: All retry attempts failed, no direct URL found")
+        return None
+
+    def _extract_job_url_direct_from_external_apply(self, job_id: str) -> str | None:
+        """
+        Call /jobs/view/externalApply/{job_id} and extract the url= param from
+        the effective URL or Location header (without requiring a non-LinkedIn redirect).
+        Enhanced: Also check if final URL is external (non-LinkedIn) as direct URL.
+        """
+        try:
+            # Global throttle: ≤ 8 calls/sec
+            now = time.time()
+            self._ext_apply_calls = [t for t in self._ext_apply_calls if now - t < 1.0]
+            if len(self._ext_apply_calls) >= 8:
+                time.sleep(0.15)
+            self._ext_apply_calls.append(time.time())
+            url = f"{self.base_url}/jobs/view/externalApply/{job_id}"
+            resp = self.session.get(url, timeout=10, allow_redirects=True)
+            
+            # Check 1: If final URL is external (not LinkedIn), use it directly
+            final_url = resp.url
+            if final_url and 'linkedin.com' not in final_url.lower():
+                # It's an external URL - return it (might have query params, that's fine)
+                return final_url
+            
+            # Check 2: Parse url= param from redirect chain
+            candidate = final_url
+            # Inspect redirect history for a Location with url= param
+            if resp.history:
+                for h in resp.history:
+                    loc = h.headers.get('Location') or ''
+                    if loc and 'url=' in loc:
+                        candidate = loc
+                        # If Location is external, use it
+                        if 'linkedin.com' not in loc.lower():
+                            parsed_loc = urlparse(loc)
+                            if parsed_loc.scheme and parsed_loc.netloc:
+                                return loc.split('?')[0] if '?' in loc else loc
+            
+            # Check 3: Parse url= param from query string
+            qs = urlparse(candidate).query
+            url_param = parse_qs(qs).get('url', [None])[0]
+            if url_param:
+                decoded_url = unquote(url_param)
+                # Handle multiple levels of encoding
+                while '%' in decoded_url:
+                    try:
+                        new_decoded = unquote(decoded_url)
+                        if new_decoded == decoded_url:
+                            break
+                        decoded_url = new_decoded
+                    except Exception:
+                        break
+                decoded_url = decoded_url.split('&urlHash=')[0]
+                # Verify it's not a LinkedIn URL
+                if decoded_url and 'linkedin.com' not in decoded_url.lower():
+                    return decoded_url
+            
+            # Check 4: Check the actual response body for embedded URLs
+            try:
+                if resp.text:
+                    # Look for common URL patterns in response
+                    url_patterns = [
+                        r'url=([^"&\s<>]+)',  # url= parameter
+                        r'"(https?://[^"]+)"',  # Quoted URLs
+                        r"'(https?://[^']+)'",  # Single-quoted URLs
+                        r'location\.href\s*=\s*["\']([^"\']+)["\']',  # JavaScript redirects
+                        r'window\.open\(["\']([^"\']+)["\']',  # Window.open calls
+                    ]
+                    for pattern in url_patterns:
+                        matches = re.finditer(pattern, resp.text, re.IGNORECASE)
+                        for match in matches:
+                            potential_url = match.group(1) if match.groups() else match.group(0)
+                            # Decode if needed
+                            if '%' in potential_url:
+                                potential_url = unquote(potential_url)
+                            # Remove urlHash and other tracking params
+                            potential_url = potential_url.split('&urlHash=')[0]
+                            # Verify it's external and valid
+                            if (potential_url and 
+                                potential_url.startswith('http') and 
+                                'linkedin.com' not in potential_url.lower() and
+                                len(potential_url) > 10):  # Minimum URL length check
+                                return potential_url
+            except Exception:
+                pass
+            
+            # Check 5: Check redirect history response bodies
+            if resp.history:
+                for redirect_resp in resp.history:
+                    try:
+                        if redirect_resp.text:
+                            # Look for url= patterns in redirect response
+                            url_match = re.search(r'url=([^"&\s<>]+)', redirect_resp.text, re.IGNORECASE)
+                            if url_match:
+                                potential_url = unquote(url_match.group(1)).split('&urlHash=')[0]
+                                if (potential_url and 
+                                    'linkedin.com' not in potential_url.lower() and
+                                    len(potential_url) > 10):
+                                    return potential_url
+                    except Exception:
+                        continue
+                        
+        except Exception as e:
+            log.debug(f"externalApply extraction error for {job_id}: {e}")
+            pass
         return None
 
     def _is_easy_apply_job_from_page(self, soup: BeautifulSoup) -> bool:
@@ -690,7 +1302,7 @@ class LinkedIn(Scraper):
         # Method 3: Look for easy apply in data attributes
         if soup.find(attrs={"data-easy-apply": True}):
             return True
-        
+            
         # Method 4: Look for easy apply in class names
         if soup.find(class_=lambda x: x and "easy-apply" in " ".join(x).lower()):
             return True
@@ -759,7 +1371,7 @@ class LinkedIn(Scraper):
         
         if any(indicator in page_text for indicator in explicit_easy_apply_indicators):
             return True
-        
+            
         # For sign-in required patterns, be more careful - only filter out if we also
         # can't find any external apply URLs
         signin_indicators = [
@@ -860,7 +1472,7 @@ class LinkedIn(Scraper):
             # Only filter out if we have sign-in indicators AND no external URLs found
             if not external_urls_found:
                 return True
-        
+            
         # Method 8: NEW - Check for jobs with Apply buttons but no external apply URLs
         # This is a strong indicator of Easy Apply jobs
         import re
@@ -929,7 +1541,7 @@ class LinkedIn(Scraper):
             # If no external URLs found, it's likely Easy Apply
             if not external_urls_found:
                 return True
-
+            
         # If no clear indicators either way, be conservative and don't filter
         return False
 
