@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "jobspy-enhanced-scraper"
-version = "1.2.0"
+version = "1.3.0"
 description = "Enhanced job scraper for LinkedIn, Indeed, Glassdoor, ZipRecruiter with improved filtering capabilities"
 authors = ["Abhilash RS", "Enhanced by Community"]
 homepage = "https://github.com/A6h9lash/jobspy-enhanced-scraper"
