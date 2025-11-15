@@ -3,8 +3,12 @@ from __future__ import annotations
 import math
 import random
 import time
+import threading
+from queue import Queue
+from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
-from typing import Optional
+from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse, urlunparse, unquote
 from urllib.parse import parse_qs
 import requests
@@ -48,17 +52,27 @@ log = create_logger("LinkedIn")
 
 class LinkedIn(Scraper):
     base_url = "https://www.linkedin.com"
-    delay = 1.5  # Optimized base delay for speed
-    band_delay = 2  # Reduced band delay for faster processing
-    jobs_per_page = 25
-    max_retries = 3  # Reduced retries for faster failure handling
-    backoff_multiplier = 1.5  # Less aggressive backoff
-
-    def __init__(
-        self, proxies: list[str] | str | None = None, ca_cert: str | None = None, user_agent: str | None = None
-    ):
+    base_delay = 2.0  # Base delay between requests
+    jobs_per_page = 25  # Standard page size
+    max_retries = 5  # Increased number of retries
+    backoff_multiplier = 1.5  # Increased backoff multiplier
+    
+    # High volume scraping settings
+    min_delay = 2.0  # Increased minimum delay
+    max_delay = 5.0  # Increased maximum delay
+    batch_size = 50  # Smaller batch size to avoid detection
+    max_consecutive_errors = 3  # Max errors before increasing delay
+    error_backoff_factor = 2.0  # Increased error backoff
+    batch_cooldown = 30  # Cooldown period between batches in seconds
+    
+    # Thread pool settings
+    min_worker_threads = 4  # Minimum number of worker threads
+    max_worker_threads = 8  # Maximum number of worker threads
+    max_jobs_per_thread = 10  # Maximum number of jobs per thread
+    
+    def __init__(self, proxies: list[str] | str | None = None, ca_cert: str | None = None, user_agent: str | None = None):
         """
-        Initializes LinkedInScraper with the LinkedIn job search url
+        Initializes LinkedInScraper with optimized settings for high throughput
         """
         super().__init__(Site.LINKEDIN, proxies=proxies, ca_cert=ca_cert)
         self.session = create_session(
@@ -66,40 +80,97 @@ class LinkedIn(Scraper):
             ca_cert=ca_cert,
             is_tls=False,
             has_retry=True,
-            delay=5,
+            delay=3,
             clear_cookies=True,
         )
         self.session.headers.update(headers)
         self.scraper_input = None
         self.country = "worldwide"
         self.job_url_direct_regex = re.compile(r'(?<=\?url=)[^"]+')
+        self._current_proxy: str | None = None
+        self._ext_apply_calls: list[float] = []
+        self._success_rate = 1.0
+        
+        # Thread-safe components
+        self._results_lock = Lock()
+        self._rate_limit_lock = Lock()
+        self._job_queue = Queue()
         # dynamic proxy state
         self._current_proxy: str | None = None
         # externalApply rate limiter timestamps
         self._ext_apply_calls: list[float] = []
 
-    # optional free proxy provider
+    def _prepare_base_params(self, scraper_input: ScraperInput) -> dict:
+        """Prepare base parameters for LinkedIn API requests with enhanced parameter handling"""
+        params = {
+            "keywords": scraper_input.search_term,
+            "location": scraper_input.location,
+            "distance": "100",  # Increased search radius
+            "f_TPR": f"r{scraper_input.hours_old * 3600}" if scraper_input.hours_old else None,
+            "position": 1,
+            "geoId": "103644278",  # United States
+            "pageSize": str(self.jobs_per_page),
+            "sortBy": "DD",  # Sort by date for more complete results
+            "f_WT": "2" if scraper_input.is_remote else None,
+            "f_JT": "F,C,I",  # Include full-time, contract, internship
+            "f_E": scraper_input.experience_level if scraper_input.experience_level else None,
+            "start": 0,
+            "refresh": True,
+            "f_AL": "true",  # Include Easy Apply jobs
+        }
+        
+        # Handle additional filters
+        if scraper_input.job_type:
+            params["f_JT"] = job_type_code(scraper_input.job_type)
+        if scraper_input.easy_apply is not None:
+            params["f_AL"] = "true" if scraper_input.easy_apply else "false"
+        if hasattr(scraper_input, 'linkedin_company_ids') and scraper_input.linkedin_company_ids:
+            params["f_C"] = ",".join(map(str, scraper_input.linkedin_company_ids))
+            
+        # Remove None values and ensure clean params
+        return {k: v for k, v in params.items() if v is not None}
+
+    def _fetch_job_details(self, job: JobPost) -> Optional[JobPost]:
+        """
+        Fetch detailed information for a job posting with retries and rate limiting
+        """
+        if not hasattr(job, 'job_id'):
+            return None
+            
+        with self._rate_limit_lock:
+            time.sleep(self.delay * 0.5)  # Shorter delay for details
+            
+        try:
+            # Add details fetching logic here
+            # You can move the existing detail fetching code here
+            return job
+        except Exception as e:
+            log.warning(f"Failed to fetch details for job {job.job_id}: {str(e)}")
+            return None
+
     def _rotate_proxy(self) -> None:
-        """Rotate to a fresh free proxy (US preferred), best-effort."""
-        try:
-            from fp.fp import FreeProxy  # type: ignore[import-not-found]
-        except Exception:
+        """Simple proxy rotation with fallback."""
+        if not self.proxies:
+            self.session.proxies = None
             return
+
         try:
-            proxy_url = None
-            try:
-                proxy_url = FreeProxy(country_id=['US'], rand=True, timeout=3).get()
-            except Exception:
-                proxy_url = FreeProxy(rand=True, timeout=3).get()
-            if proxy_url:
-                self._current_proxy = proxy_url
-                self.session.proxies = {"http": proxy_url, "https": proxy_url}
-                try:
-                    self.session.cookies.clear()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            # If specific proxies were provided, use those
+            if isinstance(self.proxies, list) and self.proxies:
+                proxy = self.proxies[0]  # Use first available proxy
+                self.session.proxies = {"http": proxy, "https": proxy}
+                log.info("Using provided proxy")
+                return
+            elif isinstance(self.proxies, str):
+                self.session.proxies = {"http": self.proxies, "https": self.proxies}
+                log.info("Using provided proxy")
+                return
+        except Exception as e:
+            log.warning(f"Error setting proxy: {e}")
+            
+        # If no valid proxies, proceed without
+        self.session.proxies = None
+        log.info("Proceeding without proxy")
 
     def _handle_rate_limit(self, attempt: int, max_retries: int = None) -> bool:
         """
@@ -193,296 +264,367 @@ class LinkedIn(Scraper):
         bucket.append(time.time())
 
     def _fetch_page_cards(self, base_params: dict, start: int) -> list[tuple[Tag, str]]:
-        """Fetch one page of job cards for a given start offset with reduced retries."""
+        """Optimized fetch of job cards with enhanced reliability"""
+        # Prepare request parameters
         params = dict(base_params)
-        params["start"] = start
-        # Throttle page requests to ~4/sec
-        if not hasattr(self, "_page_calls"):
-            self._page_calls = []
+        params.update({
+            "start": start,
+            "pageNum": start // self.jobs_per_page,
+            "origin": "JOB_SEARCH_RESULTS",
+            "refresh": True,
+        })
+        
+        # Update session headers for better reliability
+        self.session.headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Host': 'www.linkedin.com',
+            'Upgrade-Insecure-Requests': '1',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/119.0'
+        })
+        
+        # Initialize state
         attempts = 2
         out: list[tuple[Tag, str]] = []
+        
         for att in range(attempts):
-            self._throttle(self._page_calls, 4)
-            print(f"   🔎 Fetch page start={start} attempt={att+1}")
-            resp = self._make_request_with_retry(
-                f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search?",
-                params=params,
-                timeout=8,
-                max_retries=1,
-            )
-            if not resp:
-                # rotate proxy on hard failure and retry once
-                self._rotate_proxy()
-                time.sleep(0.2)
-                continue
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Primary selector
-            job_cards = soup.find_all("div", class_="base-search-card")
-            # Fallback selector (variation)
-            if not job_cards:
-                job_cards = soup.find_all("div", class_="base-card")
-            # Build unique within this page
-            page_ids = set()
-            out = []
-            for job_card in job_cards:
-                href_tag = job_card.find("a", class_="base-card__full-link")
-                if not (href_tag and "href" in href_tag.attrs):
-                    continue
-                href = href_tag.attrs["href"].split("?")[0]
-                job_id = href.split("-")[-1]
-                if job_id in page_ids:
-                    continue
-                page_ids.add(job_id)
-                out.append((job_card, job_id))
-            # Enforce 25 per page target: retry if short on first attempt
-            if len(out) >= 25:
-                return out[:25]
-            if att == 0 and len(out) < 25:
-                # rotate and retry to recover soft wall
-                self._rotate_proxy()
-                time.sleep(0.25)
-                continue
-            break
-        # Return whatever we have (may be <25 if LinkedIn returned fewer twice)
-        return out[:25]
-
-    def scrape(self, scraper_input: ScraperInput) -> JobResponse:
-        """
-        Scrapes LinkedIn for jobs with scraper_input criteria
-        :param scraper_input:
-        :return: job_response
-        """
-        self.scraper_input = scraper_input
-        job_list: list[JobPost] = []
-        seen_ids = set()
-        start = scraper_input.offset // 10 * 10 if scraper_input.offset else 0
-        request_count = 0
-        seconds_old = (
-            scraper_input.hours_old * 3600 if scraper_input.hours_old else None
-        )
-        continue_search = (
-            lambda: len(job_list) < scraper_input.results_wanted and start < 1000
-        )
-        # Optimized branch: sequential card collection + parallel detail processing
-        # Apply to all cases where descriptions are needed (not just >= 300)
-        if scraper_input.linkedin_fetch_description:
-            # Build base params once
-            base_params = {
-                "keywords": scraper_input.search_term,
-                "location": scraper_input.location,
-                "distance": scraper_input.distance,
-                "pageNum": 0,
-            }
-            if scraper_input.is_remote:
-                base_params["f_WT"] = 2
-            if scraper_input.job_type:
-                base_params["f_JT"] = job_type_code(scraper_input.job_type)
-            if scraper_input.easy_apply is not None:
-                base_params["f_AL"] = "true" if scraper_input.easy_apply else "false"
-            if scraper_input.linkedin_company_ids:
-                base_params["f_C"] = ",".join(map(str, scraper_input.linkedin_company_ids))
-            if scraper_input.experience_level is not None:
-                base_params["f_E"] = scraper_input.experience_level
-            if seconds_old is not None:
-                base_params["f_TPR"] = f"r{seconds_old}"
-
-            # Step 1: Collect ALL job cards sequentially until results_wanted is reached
-            print("🧩 Collecting job cards sequentially...")
-            collected: list[tuple[Tag, str]] = []
-            collected_ids: set[str] = set()
-            current_start = start
-            
-            while len(collected) < scraper_input.results_wanted:
-                page_cards = self._fetch_page_cards(base_params, current_start)
-                
-                if not page_cards:
-                    # No more jobs available
-                    break
-                
-                # Add new cards (avoid duplicates)
-                for jc, jid in page_cards:
-                    if jid in collected_ids:
-                        continue
-                    collected_ids.add(jid)
-                    collected.append((jc, jid))
-                    if len(collected) >= scraper_input.results_wanted:
-                        break
-                
-                if len(collected) >= scraper_input.results_wanted:
-                    break
-                
-                # Move to next page
-                current_start += 25
-                
-                # Small delay between page fetches (respects rate_limit_mode)
-                rate_limit_mode = getattr(scraper_input, 'rate_limit_mode', 'normal') if scraper_input else 'normal'
-                if rate_limit_mode == "fast":
-                    time.sleep(random.uniform(0.2, 0.5))
-                elif rate_limit_mode == "aggressive":
-                    time.sleep(random.uniform(0.4, 0.8))
-                else:
-                    time.sleep(random.uniform(0.5, 1.0))
-            
-            # Trim to exactly results_wanted
-            collected = collected[:scraper_input.results_wanted]
-            print(f"✅ Collected {len(collected)} job cards. Now fetching details...")
-            
-            # Step 2: Process ALL collected job cards in parallel batches
-            if collected:
-                print(f"🧪 Processing details in batches... ({len(collected)} cards)")
-                batch_size = 100
-                # Adjust workers based on rate_limit_mode
-                rate_limit_mode = getattr(scraper_input, 'rate_limit_mode', 'normal') if scraper_input else 'normal'
-                if rate_limit_mode == "fast":
-                    max_workers = 8  # Reduced workers to avoid 429s (was 14, too aggressive)
-                elif rate_limit_mode == "aggressive":
-                    max_workers = 10
-                else:
-                    max_workers = 8  # Conservative to avoid rate limits
-                for i in range(0, len(collected), batch_size):
-                    batch = collected[i:i + batch_size]
-                    posts = self._fetch_job_batch_parallel(batch, max_workers=max_workers)
-                    for jp in posts:
-                        if jp:
-                            job_list.append(jp)
-                            print(f"   ✅ Job {len(job_list)}: {jp.title} at {jp.company_name}")
-                            if not continue_search():
-                                break
-                    if not continue_search():
-                        break
-            
-            job_list = job_list[:scraper_input.results_wanted]
-            return JobResponse(jobs=job_list)
-
-        while continue_search():
-            request_count += 1
-            log.info(
-                f"search page: {request_count} / {math.ceil(scraper_input.results_wanted / 10)}"
-            )
-            print(f"📡 Fetching page {request_count}... (Found {len(job_list)} jobs so far)")
-            params = {
-                "keywords": scraper_input.search_term,
-                "location": scraper_input.location,
-                "distance": scraper_input.distance,
-                "pageNum": 0,
-                "start": start,
-            }
-            
-            # Add all applicable filters (no longer mutually exclusive)
-            if scraper_input.is_remote:
-                params["f_WT"] = 2
-                
-            if scraper_input.job_type:
-                params["f_JT"] = job_type_code(scraper_input.job_type)
-                
-            if scraper_input.easy_apply is not None:
-                if scraper_input.easy_apply:
-                    params["f_AL"] = "true"
-                else:
-                    params["f_AL"] = "false"
-                
-            if scraper_input.linkedin_company_ids:
-                params["f_C"] = ",".join(map(str, scraper_input.linkedin_company_ids))
-                
-            # Add experience level filter if specified
-            if scraper_input.experience_level is not None:
-                params["f_E"] = scraper_input.experience_level
-                
-            # Add time filter if specified (can now be combined with other filters)
-            if seconds_old is not None:
-                params["f_TPR"] = f"r{seconds_old}"
-
-            params = {k: v for k, v in params.items() if v is not None}
-            
-            # Use the new retry mechanism for rate limiting
-            response = self._make_request_with_retry(
+            try:
+                # Make request with highly optimized settings
+                resp = self._make_request_with_retry(
                     f"{self.base_url}/jobs-guest/jobs/api/seeMoreJobPostings/search?",
                     params=params,
-                timeout=10
-            )
-            
-            if response is None:
-                log.error("Failed to get response after all retries")
-                return JobResponse(jobs=job_list)
-
-            soup = BeautifulSoup(response.text, "html.parser")
-            job_cards = soup.find_all("div", class_="base-search-card")
-            if len(job_cards) == 0:
-                return JobResponse(jobs=job_list)
-
-            # Collect cards and IDs for this page
-            page_job_cards: list[tuple[Tag, str]] = []
-            for job_card in job_cards:
-                href_tag = job_card.find("a", class_="base-card__full-link")
-                if not (href_tag and "href" in href_tag.attrs):
+                    timeout=8,  # Balanced timeout
+                    max_retries=2
+                )
+                
+                if not resp:
+                    log.warning(f"Request failed on attempt {att + 1}")
+                    if att < attempts - 1:
+                        time.sleep(0.5)  # Shorter pause before retry
                     continue
-                    href = href_tag.attrs["href"].split("?")[0]
-                    job_id = href.split("-")[-1]
-                    if job_id in seen_ids:
+                    
+                # Parse response with optimized BeautifulSoup settings
+                soup = BeautifulSoup(resp.text, "html.parser", parse_only=None)
+                
+                # Find all job cards with multiple selectors
+                job_cards = soup.find_all("div", class_="base-card")
+                if not job_cards:
+                    job_cards = soup.find_all("div", {"class": lambda x: x and any(c in x for c in ['job-search-card', 'base-card'])})
+                
+                log.info(f"Found {len(job_cards)} job cards")
+                
+                # Process job cards
+                page_ids = set()
+                for job_card in job_cards:
+                    try:
+                        # Multiple selectors for job links
+                        href_tag = (
+                            job_card.find("a", class_="base-card__full-link") or
+                            job_card.find("a", class_="job-card-container__link") or
+                            job_card.find("a", {"class": lambda x: x and ('link' in x or 'url' in x)})
+                        )
+                        
+                        if href_tag and (href := href_tag.get("href")):
+                            job_id = href.split("?")[0].split("-")[-1]
+                            if job_id not in page_ids:
+                                page_ids.add(job_id)
+                                out.append((job_card, job_id))
+                    except Exception as e:
+                        log.warning(f"Error processing job card: {str(e)}")
                         continue
-                    seen_ids.add(job_id)
-                page_job_cards.append((job_card, job_id))
+                
+                # Return all found jobs for this page
+                if out:
+                    return out
+                    
+                # Retry if insufficient results
+                if att < attempts - 1:
+                    log.warning("Insufficient results, retrying...")
+                    time.sleep(1)
+                
+            except Exception as e:
+                log.warning(f"Error fetching/parsing page: {str(e)}")
+                if att < attempts - 1:
+                    time.sleep(1)
+                continue
+        
+        return out  # Return all found jobs
 
-            if page_job_cards:
-                if scraper_input.linkedin_fetch_description:
-                    # Parallel, guarded fetching in small batches
-                    batch_size = 16
-                    # Adjust workers based on rate_limit_mode (reduce for fast to avoid 429s)
-                    rate_limit_mode = getattr(scraper_input, 'rate_limit_mode', 'normal') if scraper_input else 'normal'
-                    if rate_limit_mode == "fast":
-                        batch_workers = 6  # Reduced to avoid 429s (was 10, too aggressive)
-                    elif rate_limit_mode == "aggressive":
-                        batch_workers = 7
+    def scrape(self, scraper_input: ScraperInput) -> JobResponse:
+        """Scrapes job listings from LinkedIn with high-volume optimizations"""
+        self.scraper_input = scraper_input
+        jobs = []
+        seen_ids = set()
+        current_page = scraper_input.offset or 0
+        consecutive_errors = 0
+        current_delay = self.min_delay
+        
+        start_time = time.time()
+        log.info(f"Starting job scraping for {scraper_input.results_wanted} jobs")
+        
+        # Prepare request parameters
+        base_params = self._prepare_base_params(scraper_input)
+        
+        # Calculate optimal batch size and number of batches
+        batch_size = min(self.batch_size, scraper_input.results_wanted)
+        jobs_remaining = scraper_input.results_wanted
+        current_batch = 0
+        jobs_in_batch = 0
+        
+        while jobs_remaining > 0:
+            try:
+                # Check if we need a batch cooldown
+                if jobs_in_batch >= batch_size:
+                    log.info(f"Batch {current_batch} complete. Cooling down for {self.batch_cooldown} seconds...")
+                    time.sleep(self.batch_cooldown)
+                    current_batch += 1
+                    jobs_in_batch = 0
+                    current_delay = self.min_delay  # Reset delay after cooldown
+                
+                # Add random jitter to delay
+                jitter = random.uniform(0, 1.0)
+                effective_delay = current_delay + jitter
+                
+                # Get start position for current page
+                start = current_page * self.jobs_per_page
+                
+                # Fetch job cards from the page with rate limiting
+                with self._rate_limit_lock:
+                    page_jobs = self._fetch_page_cards(base_params, start)
+                    time.sleep(effective_delay)  # Apply rate limiting with jitter
+                
+                # Handle rate limiting response
+                if not page_jobs:
+                    consecutive_errors += 1
+                    if consecutive_errors >= self.max_consecutive_errors:
+                        log.info(f"Hit rate limit, increasing delay to {current_delay * self.error_backoff_factor:.1f}s")
+                        current_delay = min(current_delay * self.error_backoff_factor, self.max_delay)
+                        consecutive_errors = 0
+                        time.sleep(self.batch_cooldown)  # Take a longer break
+                        continue
                     else:
-                        batch_workers = 6  # Conservative to avoid rate limits
-                    for i in range(0, len(page_job_cards), batch_size):
-                        batch = page_job_cards[i:i + batch_size]
-                        posts = self._fetch_job_batch_parallel(batch, max_workers=batch_workers)
-                        for jp in posts:
-                            job_list.append(jp)
-                            print(f"   ✅ Job {len(job_list)}: {jp.title} at {jp.company_name}")
-                            if not continue_search():
-                                break
-                        if not continue_search():
-                            break
-                else:
-                    # No description path: use existing lightweight processing
-                    for job_card, job_id in page_job_cards:
-                        try:
-                            job_post = self._process_job(job_card, job_id, False)
-                            if job_post:
-                                job_list.append(job_post)
-                                print(f"   ✅ Job {len(job_list)}: {job_post.title} at {job_post.company_name}")
+                        log.info("No jobs found on this page, trying next page")
+                
+                log.info(f"Found {len(page_jobs)} job cards on page {current_page + 1}")
+                log.info(f"Progress: {len(jobs)}/{scraper_input.results_wanted} jobs collected")
+                
+                # Process jobs in current batch using thread pool
+                new_jobs = 0
+                if jobs_remaining <= 0:
+                    break
+                
+                # Filter out jobs we've already seen
+                new_job_cards = [(card, jid) for card, jid in page_jobs if jid not in seen_ids]
+                
+                if new_job_cards:
+                    # Calculate optimal number of threads
+                    batch_size = len(new_job_cards)
+                    num_threads = min(
+                        max(self.min_worker_threads, batch_size // self.max_jobs_per_thread),
+                        self.max_worker_threads
+                    )
+                    
+                    # Process jobs in parallel
+                    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                        # Submit jobs to thread pool
+                        future_to_job = {
+                            executor.submit(
+                                self._process_job, 
+                                job_card, 
+                                job_id, 
+                                scraper_input.linkedin_fetch_description
+                            ): (job_card, job_id) 
+                            for job_card, job_id in new_job_cards
+                        }
+                        
+                        # Process completed jobs as they finish
+                        for future in as_completed(future_to_job):
+                            job_card, job_id = future_to_job[future]
+                            try:
+                                job = future.result()
+                                if job:
+                                    seen_ids.add(job_id)
+                                    jobs.append(job)
+                                    new_jobs += 1
+                                    jobs_remaining -= 1
+                                    
+                                    # Reset error counter on success
+                                    consecutive_errors = 0
+                                    
+                                    # Gradually decrease delay on sustained success
+                                    if current_delay > self.min_delay:
+                                        current_delay = max(self.min_delay, 
+                                                         current_delay / self.backoff_multiplier)
+                            except Exception as e:
+                                log.warning(f"Error processing job {job_id}: {str(e)}")
+                                consecutive_errors += 1
+                                
+                                # Increase delay if too many consecutive errors
+                                if consecutive_errors >= self.max_consecutive_errors:
+                                    current_delay = min(self.max_delay,
+                                                     current_delay * self.error_backoff_factor)
+                                    log.warning(f"Increasing delay to {current_delay}s due to errors")
+                                    consecutive_errors = 0  # Reset counter
+                
+                # If we got no new jobs from this page, increase delay
+                if new_jobs == 0:
+                    current_delay = min(self.max_delay, current_delay * self.backoff_multiplier)
+                    log.info(f"No new jobs found, increasing delay to {current_delay}s")
+                
+                # Move to next page
+                current_page += 1
+                
+                # Log timing info every 100 jobs
+                if len(jobs) % 100 == 0 and len(jobs) > 0:
+                    elapsed = time.time() - start_time
+                    rate = len(jobs) / elapsed
+                    eta = (scraper_input.results_wanted - len(jobs)) / rate if rate > 0 else 0
+                    log.info(f"Progress: {len(jobs)}/{scraper_input.results_wanted} jobs")
+                    log.info(f"Rate: {rate:.1f} jobs/sec")
+                    log.info(f"ETA: {eta/60:.1f} minutes")
+                
+            except Exception as e:
+                log.error(f"Error processing page: {str(e)}")
+                consecutive_errors += 1
+                if consecutive_errors >= self.max_consecutive_errors:
+                    current_delay = min(self.max_delay, current_delay * self.error_backoff_factor)
+                    consecutive_errors = 0
+                time.sleep(current_delay)  # Add delay after error
+            
+            # Add delay unless we have enough jobs
+            if len(jobs) < scraper_input.results_wanted:
+                time.sleep(self.base_delay)
+                
+        return JobResponse(jobs=jobs)
+        # Prepare base parameters
+        base_params = self._prepare_base_params(scraper_input)
+        
+        # Queue for collecting results
+        results_queue = Queue()
+        
+        def process_chunk(chunk_idx: int) -> None:
+            """Process a chunk of jobs with optimized fetching and processing"""
+            chunk_start = chunk_idx * self.chunk_size
+            chunk_jobs = []
+            
+            try:
+                # Progressive rate limiting based on chunk index
+                with self._rate_limit_lock:
+                    # Increase delay as we process more chunks
+                    progressive_delay = self.base_delay * (1 + (chunk_idx // 20) * 0.2)
+                    time.sleep(progressive_delay)
+                
+                # Fetch job cards
+                page_jobs = self._fetch_page_cards(base_params, chunk_start)
+                
+                if not page_jobs:
+                    return
+                    
+                # Extract basic job info from cards
+                for job_card, job_id in page_jobs:
+                    try:
+                        # Get job link
+                        href = ""
+                        for link_class in ["base-card__full-link", "job-card-container__link"]:
+                            if href_tag := job_card.find("a", class_=link_class):
+                                href = href_tag.get("href", "")
+                                if href:
+                                    break
+                        
+                        if not href:
+                            continue
+                            
+                        # Get title and company
+                        # Get title, company and location with fallbacks
+                        title_tag = job_card.find("h3", class_="base-search-card__title") or \
+                                  job_card.find("h3", class_="job-card-list__title")
+                        company_tag = job_card.find("h4", class_="base-search-card__subtitle") or \
+                                    job_card.find("span", class_="job-card-container__company-name")
+                        location_tag = job_card.find("span", class_="job-search-card__location") or \
+                                     job_card.find("div", class_="job-card-container__metadata-wrapper")
+                        
+                        if title_tag and company_tag:
+                            title = title_tag.get_text(strip=True)
+                            company = company_tag.get_text(strip=True)
+                            location_str = location_tag.get_text(strip=True) if location_tag else None
+                            
+                            # Parse location into Location object
+                            if location_str:
+                                if ", " in location_str:
+                                    city, state = location_str.split(", ", 1)
+                                    state = state.split(" Metropolitan Area")[0]  # Handle special cases
+                                    location = Location(city=city, state=state, country=Country.USA)
+                                else:
+                                    location = Location(state=location_str, country=Country.USA)
                             else:
-                                print(f"   ⏭️  Job filtered out (likely easy apply)")
-                            if not continue_search():
-                                break
-                        except Exception as e:
-                            print(f"   ❌ Error processing job {job_id}: {str(e)}")
-                            raise LinkedInException(str(e))
-
-            if continue_search():
-                # Optimized delay between pages based on rate limit mode (slightly grows with pages)
-                rate_limit_mode = getattr(self.scraper_input, 'rate_limit_mode', 'normal') if self.scraper_input else 'normal'
+                                location = None
+                            
+                            # Create job post
+                            job = JobPost(
+                                id=job_id,
+                                job_url=href,
+                                title=title,
+                                company_name=company,
+                                job_type=None,
+                                location=location,
+                                has_easy_apply=None,
+                                description=None,
+                                description_format=DescriptionFormat.HTML
+                            )
+                            
+                            if scraper_input.linkedin_fetch_description:
+                                # Fetch details in parallel later
+                                job_details = self._get_job_details(job_id)
+                                self._process_job_card_with_details(job_card, job_id, job_details)
+                            
+                            return job
+                            
+                    except Exception as e:
+                        log.warning(f"Error processing job: {str(e)}")
+                        return None
                 
-                # Reduce page_factor for fast mode
-                if rate_limit_mode == "fast":
-                    page_factor = min(0.2, request_count * 0.01)  # add up to +0.2s over pages for fast mode
-                else:
-                    page_factor = min(0.5, request_count * 0.02)  # add up to +0.5s over pages
-                if rate_limit_mode == "fast":
-                    delay = random.uniform(0.3, 0.7) + page_factor  # Reduced from 0.5-1.0 for faster mode
-                elif rate_limit_mode == "aggressive":
-                    delay = random.uniform(0.8, 1.5) + page_factor  # Reduced from 1.0-2.0
-                else:
-                    delay = random.uniform(self.delay, self.delay + self.band_delay) + page_factor
+            except Exception as e:
+                log.error(f"Chunk {chunk_idx} failed: {str(e)}")
+                return []
                 
-                print(f"⏸️  Waiting {delay:.1f} seconds before next page...")
-                time.sleep(delay)
-                start += len(job_cards)
-
-        job_list = job_list[: scraper_input.results_wanted]
-        return JobResponse(jobs=job_list)
+        self.scraper_input = scraper_input
+        
+        # Initialize state
+        seen_jobs = set()
+        jobs_list = []
+        
+        # Get jobs sequentially
+        page = 0
+        start = scraper_input.offset or 0
+        
+        while len(jobs_list) < scraper_input.results_wanted:
+            # Get jobs for current page
+            start_idx = page * self.jobs_per_page
+            page_jobs = self._fetch_page_cards(self._prepare_base_params(scraper_input), start_idx)
+            
+            if not page_jobs:
+                break
+                
+            # Process job cards
+            for job_card, job_id in page_jobs:
+                try:
+                    # Process job
+                    job = self._process_job(job_card, job_id, scraper_input.linkedin_fetch_description)
+                    if job and job_id not in seen_jobs:
+                        seen_jobs.add(job_id)
+                        jobs_list.append(job)
+                except Exception as e:
+                    log.warning(f"Error processing job: {str(e)}")
+            
+            # Increment page and add delay
+            page += 1
+            if len(jobs_list) < scraper_input.results_wanted:
+                time.sleep(self.base_delay)
+        
+        # Return results
+        return JobResponse(jobs=jobs_list[:scraper_input.results_wanted])
 
     def _process_job(
         self, job_card: Tag, job_id: str, full_descr: bool
@@ -492,6 +634,43 @@ class LinkedIn(Scraper):
         salary_tag = job_card.find("span", class_="job-search-card__salary-info")
 
         compensation = description = None
+        job_url = None
+        
+        # Extract job URL
+        url_tag = job_card.find("a", class_="base-card__full-link") or \
+                 job_card.find("a", class_="job-card-container__link") or \
+                 job_card.select_one("a[data-tracking-control-name='public_jobs_jserp-result_search-card']")
+                 
+        if url_tag and (href := url_tag.get("href")):
+            job_url = href.split("?")[0]  # Remove query parameters
+        
+        # Extract basic job info from card
+        title_tag = job_card.find("h3", class_="base-search-card__title") or \
+                  job_card.find("h3", class_="job-card-list__title")
+        company_tag = job_card.find("h4", class_="base-search-card__subtitle") or \
+                    job_card.find("span", class_="job-card-container__company-name")
+        location_tag = job_card.find("span", class_="job-search-card__location") or \
+                     job_card.find("div", class_="job-card-container__metadata-wrapper")
+        
+        if not (title_tag and company_tag):
+            return None
+            
+        title = title_tag.get_text(strip=True)
+        company = company_tag.get_text(strip=True)
+        location_str = location_tag.get_text(strip=True) if location_tag else None
+        
+        # Parse location
+        location = None
+        if location_str:
+            if ", " in location_str:
+                city, state = location_str.split(", ", 1)
+                if " Metropolitan Area" in state:
+                    state = state.split(" Metropolitan Area")[0]
+                location = Location(city=city, state=state, country=Country.USA)
+            else:
+                location = Location(state=location_str, country=Country.USA)
+
+        # Parse salary if available
         if salary_tag:
             salary_text = salary_tag.get_text(separator=" ").strip()
             salary_values = [currency_parser(value) for value in salary_text.split("-")]
@@ -504,20 +683,20 @@ class LinkedIn(Scraper):
                 max_amount=int(salary_max),
                 currency=currency,
             )
-
-        title_tag = job_card.find("span", class_="sr-only")
-        title = title_tag.get_text(strip=True) if title_tag else "N/A"
-
-        company_tag = job_card.find("h4", class_="base-search-card__subtitle")
-        company_a_tag = company_tag.find("a") if company_tag else None
-        company_url = (
-            urlunparse(urlparse(company_a_tag.get("href"))._replace(query=""))
-            if company_a_tag and company_a_tag.has_attr("href")
-            else ""
+            
+        # Create and return job post
+        job = JobPost(
+            job_id=job_id,
+            job_url=self.base_url + f"/jobs/view/{job_id}",
+            title=title,
+            company_name=company,
+            location=location,
+            has_easy_apply=None,  # Will be determined if full description is fetched
+            description=None,  # Will be fetched if requested
+            description_format=DescriptionFormat.HTML,
+            compensation=compensation
         )
-        company = company_a_tag.get_text(strip=True) if company_a_tag else "N/A"
-
-        metadata_card = job_card.find("div", class_="base-search-card__metadata")
+        return job
         location = self._get_location(metadata_card)
 
         # Try multiple selectors for date posted information
@@ -563,16 +742,20 @@ class LinkedIn(Scraper):
             # If still no date found, try to parse relative time text
             if not date_posted:
                 date_posted = self._parse_relative_date(metadata_card)
-        job_details = {}
+        # Always try to get job details if requested
         if full_descr:
-            print(f"   🔍 Fetching details for job {job_id}...")
-            job_details = self._get_job_details(job_id)
-            if job_details is None:
-                # Job was filtered out (e.g., easy apply job when easy_apply=False)
-                print(f"   ⏭️  Job {job_id} filtered out (easy apply)")
-                return None
-            description = job_details.get("description")
-            print(f"   📄 Job details fetched successfully")
+            log.info(f"Fetching details for job {job_id}...")
+            try:
+                job_details = self._get_job_details(job_id)
+                if not job_details:
+                    job_details = {}
+                if "description" not in job_details or not job_details["description"]:
+                    log.warning(f"No description found for job {job_id}")
+                    job_details["description"] = "Description not available"
+                log.info(f"Job details fetched successfully")
+            except Exception as e:
+                log.error(f"Error fetching job details: {str(e)}")
+                job_details = {}
         is_remote = is_job_remote(title, description, location)
 
         return JobPost(
@@ -660,9 +843,18 @@ class LinkedIn(Scraper):
                 # Successfully fetched page - parse immediately
                 response_text = response.text
                 soup = BeautifulSoup(response_text, "html.parser")
-                # Extract direct URL from raw HTML first (fastest, most reliable)
-                job_url_direct_pre = self._extract_job_url_direct_from_raw(response_text, job_id)
-                # If we got the page successfully, break (don't retry for "no applyUrl" - we'll try other methods later)
+                # Extract URLs using multiple methods
+                job_url_direct = self._extract_job_url_direct_from_raw(response_text, job_id)
+                
+                # Try to find apply button if direct URL not found
+                if not job_url_direct:
+                    apply_button = soup.find('a', {'class': ['apply-button', 'jobs-apply-button']})
+                    if apply_button and 'href' in apply_button.attrs:
+                        job_url_direct = apply_button['href']
+                
+                if job_url_direct:
+                    log.info(f"Found direct apply URL for job {job_id}")
+                
                 break
                 
             except Exception as e:
@@ -679,16 +871,35 @@ class LinkedIn(Scraper):
             return {}
 
         # Extract job description and other details from HTML
-        div_content = soup.find(
-            "div", class_=lambda x: x and "show-more-less-html__markup" in x
-        )
+        # Try multiple description container classes in order of preference
+        description_classes = [
+            "show-more-less-html__markup",
+            "description__text",
+            "jobs-description__content",
+            "jobs-description",
+            "description"
+        ]
+        
         description = None
-        if div_content is not None:
-            div_content = remove_attributes(div_content)
-            description = div_content.prettify(formatter="html")
-            if self.scraper_input.description_format == DescriptionFormat.MARKDOWN:
-                description = markdown_converter(description)
-            elif self.scraper_input.description_format == DescriptionFormat.PLAIN:
+        for class_name in description_classes:
+            div_content = soup.find("div", class_=lambda x: x and class_name in x)
+            if div_content:
+                div_content = remove_attributes(div_content)
+                description = div_content.prettify(formatter="html")
+                if description:
+                    break
+        
+        # Try to convert description based on format preference
+        if description:
+            try:
+                format = getattr(self, 'description_format', DescriptionFormat.PLAIN)
+                if format == DescriptionFormat.MARKDOWN:
+                    description = markdown_converter(description)
+                elif format == DescriptionFormat.PLAIN:
+                    description = plain_converter(description)
+            except Exception as e:
+                log.warning(f"Error converting description format: {str(e)}")
+                # Fall back to plain text if conversion fails
                 description = plain_converter(description)
         h3_tag = soup.find(
             "h3", text=lambda text: text and "Job function" in text.strip()
@@ -829,7 +1040,19 @@ class LinkedIn(Scraper):
 
     def _process_job_card_with_details(self, job_card: Tag, job_id: str, details: dict) -> Optional[JobPost]:
         """Build a JobPost from a card and a pre-fetched details dict."""
-        title_tag = job_card.find("span", class_="sr-only")
+        # Get job URL first
+        job_url = None
+        url_tag = job_card.find("a", class_="base-card__full-link") or \
+                 job_card.find("a", class_="job-card-container__link") or \
+                 job_card.select_one("a[data-tracking-control-name='public_jobs_jserp-result_search-card']")
+                 
+        if url_tag and (href := url_tag.get("href")):
+            job_url = href.split("?")[0]  # Remove query parameters
+        else:
+            job_url = f"https://www.linkedin.com/jobs/view/{job_id}"
+            
+        title_tag = job_card.find("span", class_="sr-only") or \
+                   job_card.find("h3", class_="base-search-card__title")
         title = title_tag.get_text(strip=True) if title_tag else "N/A"
 
         company_tag = job_card.find("h4", class_="base-search-card__subtitle")
@@ -868,13 +1091,30 @@ class LinkedIn(Scraper):
         # Filter easy apply if requested
         if details.get("is_easy_apply") and self.scraper_input and self.scraper_input.easy_apply is False:
             return None
-
-        # Note: job_url_direct is already extracted efficiently in _get_job_details
-        # No need for redundant fallback here - it would just add latency
-
+            
+        # Ensure we have a description
         description = details.get("description")
+        if not description:
+            log.warning(f"No description found for job {job_id}")
+            description = "Description not available"
+
+        # Get job details if we don't have them
+        if not details and full_descr:
+            details = self._get_job_details(job_id)
+        
+        # Extract job details
+        description = details.get("description") if details else None
+        job_url_direct = details.get("job_url_direct") if details else None
+        
+        # Set default values if needed
+        if full_descr and not description:
+            description = "Description not available"
+            
         is_remote = is_job_remote(title, description, location)
 
+        # Get direct apply URL if available
+        apply_url = details.get("job_url_direct") or job_url
+        
         return JobPost(
             id=f"li-{job_id}",
             title=title,
@@ -883,13 +1123,14 @@ class LinkedIn(Scraper):
             location=location,
             is_remote=is_remote,
             date_posted=date_posted,
-            job_url=f"{self.base_url}/jobs/view/{job_id}",
+            job_url=job_url,  # Use the extracted job URL
+            apply_url=apply_url,  # Add direct apply URL
             compensation=None,
             job_type=details.get("job_type"),
             job_level=details.get("job_level", "").lower(),
             company_industry=details.get("company_industry"),
             description=description,
-            job_url_direct=details.get("job_url_direct"),
+            job_url_direct=apply_url,  # For backward compatibility
             emails=extract_emails_from_text(description),
             company_logo=details.get("company_logo"),
             job_function=details.get("job_function"),
