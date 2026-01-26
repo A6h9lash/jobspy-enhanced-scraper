@@ -134,6 +134,13 @@ def scrape_jobs(
             job_url = job_data["job_url"]
             job_data["site"] = site
             job_data["company"] = job_data["company_name"]
+            
+            # Add applyType field based on job_url_direct
+            if job_data.get("job_url_direct"):
+                job_data["applyType"] = "EXTERNAL"
+            else:
+                job_data["applyType"] = "EASY_APPLY"
+            
             job_data["job_type"] = (
                 ", ".join(job_type.value[0] for job_type in job_data["job_type"])
                 if job_data["job_type"]
