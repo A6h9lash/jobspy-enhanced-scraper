@@ -136,10 +136,21 @@ def scrape_jobs(
             job_data["company"] = job_data["company_name"]
             
             # Add applyType field based on job_url_direct
-            if job_data.get("job_url_direct"):
-                job_data["applyType"] = "EXTERNAL"
-            else:
-                job_data["applyType"] = "EASY_APPLY"
+            # If applyType is blank or NULL, check job_url_direct
+            existing_apply_type = job_data.get("applyType")
+            job_url_direct = job_data.get("job_url_direct")
+            
+            # Only set applyType if it's blank, NULL, or doesn't exist
+            if not existing_apply_type or str(existing_apply_type).strip() == "" or str(existing_apply_type).lower() == "nan":
+                if not job_url_direct or str(job_url_direct).strip() == "" or str(job_url_direct).lower() == "nan":
+                    # If job_url_direct is blank/null, it's EASY_APPLY
+                    job_data["applyType"] = "EASY_APPLY"
+                elif "http://www.indeed.com/" in str(job_url_direct).lower():
+                    # If job_url_direct contains indeed.com domain, it's EASY_APPLY
+                    job_data["applyType"] = "EASY_APPLY"
+                else:
+                    # Otherwise, it's an external company portal
+                    job_data["applyType"] = "EXTERNAL"
             
             job_data["job_type"] = (
                 ", ".join(job_type.value[0] for job_type in job_data["job_type"])
