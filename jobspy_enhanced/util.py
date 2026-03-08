@@ -330,6 +330,7 @@ desired_order = [
     "job_url",
     "job_url_direct",
     "applyType",
+    "is_c2c_or_w2",
     "title",
     "company",
     "location",

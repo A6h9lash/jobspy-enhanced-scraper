@@ -5,6 +5,7 @@ from typing import Tuple
 
 import pandas as pd
 
+from jobspy_enhanced.dice import Dice
 from jobspy_enhanced.glassdoor import Glassdoor
 from jobspy_enhanced.google import Google
 from jobspy_enhanced.indeed import Indeed
@@ -58,6 +59,7 @@ def scrape_jobs(
     SCRAPER_MAPPING = {
         Site.LINKEDIN: LinkedIn,
         Site.INDEED: Indeed,
+        Site.DICE: Dice,
         Site.ZIP_RECRUITER: ZipRecruiter,
         Site.GLASSDOOR: Glassdoor,
         Site.GOOGLE: Google,
@@ -107,7 +109,8 @@ def scrape_jobs(
         scraped_data: JobResponse = scraper.scrape(scraper_input)
         cap_name = site.value.capitalize()
         site_name = "ZipRecruiter" if cap_name == "Zip_recruiter" else cap_name
-        site_name = "LinkedIn" if cap_name == "Linkedin" else cap_name
+        site_name = "LinkedIn" if cap_name == "Linkedin" else site_name
+        site_name = "Dice" if site == Site.DICE else site_name
         create_logger(site_name).info(f"finished scraping")
         return site.value, scraped_data
 
@@ -135,21 +138,18 @@ def scrape_jobs(
             job_data["site"] = site
             job_data["company"] = job_data["company_name"]
             
-            # Add applyType field based on job_url_direct
-            # If applyType is blank or NULL, check job_url_direct
-            existing_apply_type = job_data.get("applyType")
+            # applyType: from page source (e.g. Dice "applyType" component) or inferred from job_url_direct
+            existing_apply_type = getattr(job, "applyType", None) or job_data.get("applyType")
             job_url_direct = job_data.get("job_url_direct")
-            
-            # Only set applyType if it's blank, NULL, or doesn't exist
-            if not existing_apply_type or str(existing_apply_type).strip() == "" or str(existing_apply_type).lower() == "nan":
+            if existing_apply_type and str(existing_apply_type).strip() and str(existing_apply_type).lower() != "nan":
+                job_data["applyType"] = existing_apply_type
+            else:
+                # Infer: EASY_APPLY when no external URL or indeed.com; else EXTERNAL
                 if not job_url_direct or str(job_url_direct).strip() == "" or str(job_url_direct).lower() == "nan":
-                    # If job_url_direct is blank/null, it's EASY_APPLY
                     job_data["applyType"] = "EASY_APPLY"
                 elif "http://www.indeed.com/" in str(job_url_direct).lower():
-                    # If job_url_direct contains indeed.com domain, it's EASY_APPLY
                     job_data["applyType"] = "EASY_APPLY"
                 else:
-                    # Otherwise, it's an external company portal
                     job_data["applyType"] = "EXTERNAL"
             
             job_data["job_type"] = (
@@ -212,6 +212,8 @@ def scrape_jobs(
             job_data["company_reviews_count"] = job_data.get("company_reviews_count")
             job_data["vacancy_count"] = job_data.get("vacancy_count")
             job_data["work_from_home_type"] = job_data.get("work_from_home_type")
+            # W2, C2C, or null only
+            job_data["is_c2c_or_w2"] = getattr(job, "w2_c2c_type", None) if getattr(job, "w2_c2c_type", None) in ("W2", "C2C") else None
 
             job_df = pd.DataFrame([job_data])
             jobs_dfs.append(job_df)
