@@ -10,3 +10,4 @@ pydantic>=2.3.0
 regex>=2024.4.28
 requests>=2.31.0
 tls-client>=1.0.1
+python-dotenv>=1.0.0
