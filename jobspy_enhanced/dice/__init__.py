@@ -7,9 +7,6 @@ import traceback
 from datetime import datetime
 from typing import List, Optional, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
-from supabase import create_client
-
 from bs4 import BeautifulSoup
 
 from jobspy_enhanced.model import (
@@ -25,7 +22,7 @@ from jobspy_enhanced.util import (
     create_session,
     create_logger,
 )
-from jobspy_enhanced.dice.constant import DICE_BASE_URL, SEARCH_TERMS
+from jobspy_enhanced.dice.constant import DICE_BASE_URL
 from jobspy_enhanced.dice import util
 
 log = create_logger("Dice")
@@ -602,64 +599,3 @@ class Dice(Scraper):
         stats = self.get_summary_statistics(jobs)
         print(f"\n\n{'='*80}\nSUMMARY STATISTICS\n{'='*80}")
         print(f"Total Jobs Found: {stats['total_jobs']}\nJobs with External Apply URL: {stats['jobs_with_external_apply']} ({stats['jobs_with_external_apply_percent']:.1f}%)\nRemote Jobs: {stats['remote_jobs']} ({stats['remote_jobs_percent']:.1f}%)\nJobs with Skills Listed: {stats['jobs_with_skills']} ({stats['jobs_with_skills_percent']:.1f}%)\nJobs with Salary Info: {stats['jobs_with_salary']} ({stats['jobs_with_salary_percent']:.1f}%)\nJobs with Experience Info: {stats['jobs_with_experience']} ({stats['jobs_with_experience_percent']:.1f}%)\nJobs with Employment Type: {stats['jobs_with_employment_type']} ({stats['jobs_with_employment_type_percent']:.1f}%)")
-
-def run_dice_scraper():
-    """Main runner function integrated from run_dice.py."""
-    load_dotenv()
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_KEY")
-
-    if not supabase_url or not supabase_key or "your-" in supabase_url:
-        print("⚠ ERROR: Set SUPABASE_URL and SUPABASE_KEY in your .env file")
-        return
-
-    supabase = create_client(supabase_url, supabase_key)
-    print(f"✓ Connected to Supabase: {supabase_url}")
-    print(f"\nInitializing Dice scraper for {len(SEARCH_TERMS)} search domains...")
-    
-    scraper = Dice()
-    total_inserted = 0
-    total_scraped = 0
-    seen_job_ids = set()
-
-    for idx, term in enumerate(SEARCH_TERMS, 1):
-        print(f"\n{'='*80}")
-        print(f"[{idx}/{len(SEARCH_TERMS)}] Scraping: '{term}'")
-        print(f"{'='*80}")
-
-        try:
-            scraper_input = ScraperInput(
-                site_type=[Site.DICE],
-                search_term=term,
-                location="United States",
-                results_wanted=100,
-                hours_old=24,
-                country=Country.USA
-            )
-
-            job_response = scraper.scrape(scraper_input)
-            new_jobs = []
-            for job in job_response.jobs:
-                if job.id not in seen_job_ids:
-                    seen_job_ids.add(job.id)
-                    new_jobs.append(job)
-
-            total_scraped += len(new_jobs)
-
-            if new_jobs:
-                inserted = util.insert_to_supabase(supabase, new_jobs, term)
-                total_inserted += inserted
-                print(f"  → {len(job_response.jobs)} found, {len(new_jobs)} new, {inserted} inserted to Supabase")
-            else:
-                print(f"  → {len(job_response.jobs)} found, 0 new (all duplicates)")
-
-        except Exception as e:
-            print(f"  → Error scraping '{term}': {e}")
-            traceback.print_exc()
-            continue
-
-    print(f"\n\n{'='*80}")
-    print(f"SCRAPING COMPLETE")
-    print(f"{'='*80}")
-    print(f"Total unique jobs scraped: {total_scraped}")
-    print(f"Total inserted to Supabase: {total_inserted}")
